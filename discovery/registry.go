@@ -20,6 +20,18 @@ const (
 	ReasonDeregistered Reason = "deregistered"
 )
 
+// State is the readiness lifecycle of a registered instance. Only Ready
+// instances may receive traffic; Preparing instances are known to the
+// directory but not routable, and Draining instances are finishing in-flight
+// work without accepting new requests.
+type State string
+
+const (
+	StatePreparing State = "preparing"
+	StateReady     State = "ready"
+	StateDraining  State = "draining"
+)
+
 // ChangeKind enumerates directory mutations exposed to subscribers.
 type ChangeKind string
 
@@ -27,6 +39,8 @@ const (
 	ChangeRegistered   ChangeKind = "registered"
 	ChangeDeregistered ChangeKind = "deregistered"
 	ChangeExpired      ChangeKind = "expired"
+	ChangeReady        ChangeKind = "ready"
+	ChangeDraining     ChangeKind = "draining"
 )
 
 // Instance is the addressable unit published by a virtual service.
@@ -40,6 +54,13 @@ type Instance struct {
 	Addr string
 	// Metadata carries optional, opaque routing attributes.
 	Metadata map[string]string
+	// Partition namespaces the instance for partition-scoped subscribers. An
+	// empty partition is the default and stays compatible with callers that
+	// do not partition.
+	Partition string
+	// State is the readiness lifecycle. Registrations always begin in
+	// Preparing; only Ready instances are returned by ReadyInstances.
+	State State
 }
 
 // Registration is the lease handle returned by Register.
@@ -56,6 +77,8 @@ type Registration struct {
 	Lease time.Duration
 	// Deadline is the current lease expiry time.
 	Deadline time.Time
+	// State mirrors the initial readiness state (always Preparing).
+	State State
 }
 
 // Change is one versioned directory event. Versors are dense and
@@ -97,6 +120,7 @@ var (
 	ErrInvalidToken = errors.New("discovery: lease token does not match active instance")
 	ErrBadArgument  = errors.New("discovery: invalid argument")
 	ErrNoChange     = errors.New("discovery: version is ahead of directory")
+	ErrInvalidState = errors.New("discovery: readiness transition not allowed from current state")
 )
 
 // entry is the live lease record.
@@ -105,7 +129,6 @@ type entry struct {
 	token    string
 	deadline time.Time
 	lease    time.Duration
-	expired  bool
 }
 
 // Option configures a Registry.
@@ -171,6 +194,14 @@ func NewRegistry(opts ...Option) *Registry {
 	return r
 }
 
+// stateLocked reports the readiness state of a live entry.
+func (e *entry) stateLocked() State {
+	if e.inst.State == "" {
+		return StatePreparing
+	}
+	return e.inst.State
+}
+
 func key(service, id string) string { return service + "\x00" + id }
 
 func newToken() string {
@@ -192,6 +223,10 @@ func (r *Registry) Register(inst Instance, lease time.Duration) (Registration, e
 		inst.ID = newToken()
 	}
 	inst.Metadata = cloneMeta(inst.Metadata)
+	// Every incarnation starts unready; readiness must be announced
+	// explicitly after local warm-up so registration never means
+	// "can receive requests".
+	inst.State = StatePreparing
 
 	k := key(inst.Service, inst.ID)
 	now := r.clock.Now()
@@ -232,7 +267,59 @@ func (r *Registry) Register(inst Instance, lease time.Duration) (Registration, e
 		Version:  v,
 		Lease:    lease,
 		Deadline: deadline,
+		State:    StatePreparing,
 	}, nil
+}
+
+// SetReady moves a live incarnation from Preparing to Ready. The change is
+// versioned and streamed to subscribers. Repeating the transition while
+// already Ready is a no-op that returns without a new version. Draining
+// instances cannot be made ready again.
+func (r *Registry) SetReady(service, id, token string) (int64, error) {
+	return r.transition(service, id, token, StateReady)
+}
+
+// Drain moves a live incarnation to Draining. Both Preparing and Ready
+// instances may drain; the instance stops receiving traffic but keeps its
+// lease until it deregisters or expires. Repeating drain while already
+// draining is a no-op.
+func (r *Registry) Drain(service, id, token string) (int64, error) {
+	return r.transition(service, id, token, StateDraining)
+}
+
+func (r *Registry) transition(service, id, token string, target State) (int64, error) {
+	k := key(service, id)
+	now := r.clock.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.instances[k]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	if e.token != token {
+		return 0, ErrInvalidToken
+	}
+	current := e.stateLocked()
+	if current == target {
+		return r.version, nil
+	}
+	switch target {
+	case StateReady:
+		if current != StatePreparing {
+			return 0, fmt.Errorf("%w: %s -> %s", ErrInvalidState, current, target)
+		}
+	case StateDraining:
+		if current == StateDraining {
+			return r.version, nil
+		}
+	}
+	e.inst.State = target
+	kind := ChangeReady
+	if target == StateDraining {
+		kind = ChangeDraining
+	}
+	r.appendLocked(Change{Kind: kind, Instance: cloneInst(e.inst), At: now})
+	return r.version, nil
 }
 
 // Heartbeat extends the lease iff service, id and token identify the same
@@ -341,23 +428,45 @@ func (r *Registry) appendLocked(c Change) {
 func (r *Registry) Snapshot() Snapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]Instance, 0, len(r.instances))
-	for _, e := range r.instances {
-		out = append(out, cloneInst(e.inst))
-	}
-	return Snapshot{Version: r.version, Instances: out}
+	return *r.snapshotLockedScoped(nil)
 }
 
-// ChangesSince returns directory changes strictly after fromVersion.
+// ReadyInstances returns only instances that are currently Ready and may
+// receive requests, optionally restricted to one partition. Preparing and
+// draining instances are excluded. With no partitions every partition is
+// included.
+func (r *Registry) ReadyInstances(partitions ...string) []Instance {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	want := partitionSet(partitions)
+	out := make([]Instance, 0)
+	for _, e := range r.instances {
+		if e.stateLocked() != StateReady {
+			continue
+		}
+		if want != nil && !want[e.inst.Partition] {
+			continue
+		}
+		out = append(out, cloneInst(e.inst))
+	}
+	return out
+}
+
+// ChangesSince returns directory changes strictly after fromVersion. When
+// partitions are given the result is scoped to those partitions while still
+// carrying the global version; a resync snapshot covers exactly the named
+// partitions at one version so the caller never stitches together stale
+// tails from different partitions.
 //
 // If fromVersion is 0 the caller gets a full snapshot. If the requested
 // version has fallen out of the retention window the caller also gets a full
 // snapshot instead of a partial tail, so a lagging subscriber never silently
 // skips events. If fromVersion equals the current version the change list is
 // empty and Snapshot is nil.
-func (r *Registry) ChangesSince(fromVersion int64) (ReadResult, error) {
+func (r *Registry) ChangesSince(fromVersion int64, partitions ...string) (ReadResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	want := partitionSet(partitions)
 	if fromVersion < 0 {
 		return ReadResult{}, fmt.Errorf("%w: negative version", ErrBadArgument)
 	}
@@ -370,16 +479,16 @@ func (r *Registry) ChangesSince(fromVersion int64) (ReadResult, error) {
 		return ReadResult{
 			FromVersion: fromVersion,
 			Version:     r.version,
-			Snapshot:    r.snapshotLocked(),
+			Snapshot:    r.snapshotLockedScoped(want),
 		}, nil
 	}
 	res := ReadResult{FromVersion: fromVersion, Version: r.version}
 	if fromVersion == 0 {
-		res.Snapshot = r.snapshotLocked()
+		res.Snapshot = r.snapshotLockedScoped(want)
 		return res, nil
 	}
 	for _, c := range r.log {
-		if c.Version > fromVersion {
+		if c.Version > fromVersion && (want == nil || want[c.Instance.Partition]) {
 			res.Changes = append(res.Changes, c)
 		}
 	}
@@ -399,6 +508,28 @@ func (r *Registry) snapshotLocked() *Snapshot {
 		s.Instances = append(s.Instances, cloneInst(e.inst))
 	}
 	return s
+}
+
+func (r *Registry) snapshotLockedScoped(want map[string]bool) *Snapshot {
+	s := &Snapshot{Version: r.version}
+	for _, e := range r.instances {
+		if want != nil && !want[e.inst.Partition] {
+			continue
+		}
+		s.Instances = append(s.Instances, cloneInst(e.inst))
+	}
+	return s
+}
+
+func partitionSet(partitions []string) map[string]bool {
+	if len(partitions) == 0 {
+		return nil
+	}
+	m := make(map[string]bool, len(partitions))
+	for _, p := range partitions {
+		m[p] = true
+	}
+	return m
 }
 
 // Version returns the current global directory version.

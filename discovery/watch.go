@@ -22,13 +22,20 @@ type WatchEvent struct {
 //
 // The returned channel is closed when ctx is canceled. Subscribers should
 // resubscribe with the last fully applied event version after any disconnect.
-func (r *Registry) Subscribe(ctx context.Context, fromVersion int64) <-chan WatchEvent {
+//
+// partitions restricts the stream to instances in the named partitions; no
+// partitions means every partition. A partition-scoped stream still uses the
+// single global monotonic version: skipped versions belong to other
+// partitions. If the client's version falls out of the retention window it
+// receives one snapshot covering exactly its partitions at one consistent
+// version, rather than a mix of stale per-partition tails.
+func (r *Registry) Subscribe(ctx context.Context, fromVersion int64, partitions ...string) <-chan WatchEvent {
 	ch := make(chan WatchEvent, 16)
-	go r.watchLoop(ctx, fromVersion, ch)
+	go r.watchLoop(ctx, fromVersion, partitionSet(partitions), ch)
 	return ch
 }
 
-func (r *Registry) watchLoop(ctx context.Context, fromVersion int64, ch chan<- WatchEvent) {
+func (r *Registry) watchLoop(ctx context.Context, fromVersion int64, want map[string]bool, ch chan<- WatchEvent) {
 	defer close(ch)
 	last := fromVersion
 	bootstrap := fromVersion == 0
@@ -47,16 +54,16 @@ func (r *Registry) watchLoop(ctx context.Context, fromVersion int64, ch chan<- W
 	// A fresh subscriber always receives a complete baseline first, even if
 	// the directory (and version) is currently empty.
 	if bootstrap {
-		res, err := r.ChangesSince(0)
-		if err == nil && res.Snapshot != nil {
-			if !r.deliver(ctx, ch, WatchEvent{
-				Version:  res.Snapshot.Version,
-				Snapshot: res.Snapshot,
-			}) {
-				return
-			}
-			last = res.Snapshot.Version
+		r.mu.Lock()
+		snap := r.snapshotLockedScoped(want)
+		r.mu.Unlock()
+		if !r.deliver(ctx, ch, WatchEvent{
+			Version:  snap.Version,
+			Snapshot: snap,
+		}) {
+			return
 		}
+		last = snap.Version
 	}
 
 	for {
@@ -75,7 +82,7 @@ func (r *Registry) watchLoop(ctx context.Context, fromVersion int64, ch chan<- W
 		case last > 0 && last < r.oldestVersionLocked():
 			// History was compacted: resync from a full snapshot. This is the
 			// only way to catch up, so no event range can be skipped.
-			snap := r.snapshotLocked()
+			snap := r.snapshotLockedScoped(want)
 			r.mu.Unlock()
 			if !r.deliver(ctx, ch, WatchEvent{Version: snap.Version, Snapshot: snap}) {
 				return
@@ -85,7 +92,8 @@ func (r *Registry) watchLoop(ctx context.Context, fromVersion int64, ch chan<- W
 		default:
 			cur := r.version
 			for _, c := range r.log {
-				if c.Version > last && c.Version <= cur {
+				if c.Version > last && c.Version <= cur &&
+					(want == nil || want[c.Instance.Partition]) {
 					cc := c
 					ev := WatchEvent{Version: cc.Version, Change: &cc}
 					events = append(events, ev)
