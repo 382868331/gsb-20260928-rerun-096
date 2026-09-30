@@ -23,12 +23,19 @@ type WatchEvent struct {
 // The returned channel is closed when ctx is canceled. Subscribers should
 // resubscribe with the last fully applied event version after any disconnect.
 func (r *Registry) Subscribe(ctx context.Context, fromVersion int64) <-chan WatchEvent {
+	return r.SubscribePartition(ctx, AllPartitions, fromVersion)
+}
+
+// SubscribePartition starts a change stream for one partition. AllPartitions
+// subscribes to the global directory. Versions remain global even when events
+// for other partitions are filtered out.
+func (r *Registry) SubscribePartition(ctx context.Context, partition string, fromVersion int64) <-chan WatchEvent {
 	ch := make(chan WatchEvent, 16)
-	go r.watchLoop(ctx, fromVersion, ch)
+	go r.watchLoop(ctx, partition, fromVersion, ch)
 	return ch
 }
 
-func (r *Registry) watchLoop(ctx context.Context, fromVersion int64, ch chan<- WatchEvent) {
+func (r *Registry) watchLoop(ctx context.Context, partition string, fromVersion int64, ch chan<- WatchEvent) {
 	defer close(ch)
 	last := fromVersion
 	bootstrap := fromVersion == 0
@@ -47,7 +54,7 @@ func (r *Registry) watchLoop(ctx context.Context, fromVersion int64, ch chan<- W
 	// A fresh subscriber always receives a complete baseline first, even if
 	// the directory (and version) is currently empty.
 	if bootstrap {
-		res, err := r.ChangesSince(0)
+		res, err := r.ChangesSinceInPartition(partition, 0)
 		if err == nil && res.Snapshot != nil {
 			if !r.deliver(ctx, ch, WatchEvent{
 				Version:  res.Snapshot.Version,
@@ -75,7 +82,7 @@ func (r *Registry) watchLoop(ctx context.Context, fromVersion int64, ch chan<- W
 		case last > 0 && last < r.oldestVersionLocked():
 			// History was compacted: resync from a full snapshot. This is the
 			// only way to catch up, so no event range can be skipped.
-			snap := r.snapshotLocked()
+			snap := r.snapshotLocked(partition)
 			r.mu.Unlock()
 			if !r.deliver(ctx, ch, WatchEvent{Version: snap.Version, Snapshot: snap}) {
 				return
@@ -85,7 +92,7 @@ func (r *Registry) watchLoop(ctx context.Context, fromVersion int64, ch chan<- W
 		default:
 			cur := r.version
 			for _, c := range r.log {
-				if c.Version > last && c.Version <= cur {
+				if c.Version > last && c.Version <= cur && partitionMatches(c.Instance.Partition, partition) {
 					cc := c
 					ev := WatchEvent{Version: cc.Version, Change: &cc}
 					events = append(events, ev)

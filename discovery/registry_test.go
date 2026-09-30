@@ -3,10 +3,20 @@ package discovery
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 )
+
+func instanceMap(instances []Instance) map[string]Instance {
+	out := make(map[string]Instance, len(instances))
+	for _, inst := range instances {
+		out[inst.Partition+"/"+inst.Service+"/"+inst.ID] = inst
+	}
+	return out
+}
 
 func testTime() time.Time { return time.Date(2026, 9, 29, 0, 0, 0, 0, time.UTC) }
 
@@ -205,6 +215,190 @@ func TestSubscribeLaggingGetsSnapshot(t *testing.T) {
 	}
 }
 
+func TestReadinessLifecycleHidesPreparingAndDraining(t *testing.T) {
+	reg, _ := newFakeRegistry(16)
+	h, err := reg.Register(Instance{Service: "svc", ID: "a", Addr: "1:1"}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reg.ReadyInstances(); len(got) != 0 {
+		t.Fatalf("registered instance was ready: %+v", got)
+	}
+
+	readyChange, err := reg.MarkReady("svc", "a", h.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readyChange.Kind != ChangeStateChanged || readyChange.Instance.State != StateReady {
+		t.Fatalf("ready change = %+v", readyChange)
+	}
+	if got := reg.ReadyInstances(); len(got) != 1 || got[0].ID != "a" {
+		t.Fatalf("ready instances = %+v", got)
+	}
+
+	if _, err := reg.BeginDrain("svc", "a", h.Token); err != nil {
+		t.Fatal(err)
+	}
+	if got := reg.ReadyInstances(); len(got) != 0 {
+		t.Fatalf("draining instance still receives traffic: %+v", got)
+	}
+	snap := reg.Snapshot()
+	if len(snap.Instances) != 1 || snap.Instances[0].State != StateDraining {
+		t.Fatalf("draining instance missing from directory snapshot: %+v", snap)
+	}
+	if _, err := reg.MarkReady("svc", "a", h.Token); err != nil {
+		t.Fatalf("drain to ready failed: %v", err)
+	}
+}
+
+func TestPartitionSnapshotsAndMonotonicVersions(t *testing.T) {
+	reg, _ := newFakeRegistry(2)
+	pa, _ := reg.Register(Instance{Partition: "a", Service: "svc", ID: "1", Addr: "a1"}, time.Minute)
+	pb, _ := reg.Register(Instance{Partition: "b", Service: "svc", ID: "1", Addr: "b1"}, time.Minute)
+	if _, err := reg.SetStateInPartition("a", "svc", "1", pa.Token, StateReady); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.SetStateInPartition("b", "svc", "1", pb.Token, StateReady); err != nil {
+		t.Fatal(err)
+	}
+
+	asnap := reg.SnapshotPartition("a")
+	bsnap := reg.SnapshotPartition("b")
+	global := reg.Snapshot()
+	if asnap.Version != bsnap.Version || bsnap.Version != global.Version ||
+		len(asnap.Instances) != 1 || asnap.Instances[0].Partition != "a" {
+		t.Fatalf("partition snapshot mismatch: %+v %+v %+v", asnap, bsnap, global)
+	}
+	if len(bsnap.Instances) != 1 || bsnap.Instances[0].Addr != "b1" || len(global.Instances) != 2 {
+		t.Fatalf("snapshot contents = %+v %+v %+v", asnap, bsnap, global)
+	}
+
+	// Versions 1 and 2 are compacted. A partition-A subscriber at version 1
+	// must receive partition A's complete snapshot at the current version.
+	reg.RegisterInPartition("b", "svc", "2", "b2", time.Minute)
+	reg.RegisterInPartition("b", "svc", "3", "b3", time.Minute)
+	res, err := reg.ChangesSinceInPartition("a", 1)
+	if err != nil || res.Snapshot == nil || len(res.Snapshot.Instances) != 1 {
+		t.Fatalf("expected partition snapshot, got %+v err=%v", res, err)
+	}
+	if res.Version != reg.Version() || res.Snapshot.Version != res.Version {
+		t.Fatalf("snapshot versions inconsistent: %+v current=%d", res, reg.Version())
+	}
+}
+
+func TestSubscribePartitionFiltersAndKeepsGlobalVersion(t *testing.T) {
+	reg, _ := newFakeRegistry(32)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := reg.SubscribePartition(ctx, "a", 0)
+	if ev := <-ch; ev.Snapshot == nil || ev.Version != 0 {
+		t.Fatalf("initial partition event = %+v", ev)
+	}
+
+	a1, _ := reg.RegisterInPartition("a", "svc", "1", "a1", time.Minute)
+	b1, _ := reg.RegisterInPartition("b", "svc", "1", "b1", time.Minute)
+	a2, _ := reg.RegisterInPartition("a", "svc", "2", "a2", time.Minute)
+	events := drainN(t, ch, 2)
+	if events[0].Version != a1.Version || events[1].Version != a2.Version {
+		t.Fatalf("partition events = %+v, b registration version=%d", events, b1.Version)
+	}
+}
+
+func TestStaleTokenLosesConcurrentRestartDrainAndExit(t *testing.T) {
+	reg, _ := newFakeRegistry(64)
+	old, err := reg.Register(Instance{Service: "svc", ID: "node", Addr: "old"}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		<-start
+		reg.Heartbeat("svc", "node", old.Token)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		reg.Register(Instance{Service: "svc", ID: "node", Addr: "new"}, time.Minute)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		reg.BeginDrain("svc", "node", old.Token)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		reg.Deregister("svc", "node", old.Token)
+	}()
+	close(start)
+	wg.Wait()
+
+	snap := reg.Snapshot()
+	if len(snap.Instances) != 1 || snap.Instances[0].Addr != "new" || snap.Instances[0].State != StatePreparing {
+		t.Fatalf("stale operation changed new incarnation: %+v", snap)
+	}
+	if _, err := reg.Heartbeat("svc", "node", old.Token); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("old heartbeat after race = %v", err)
+	}
+}
+
+func TestSaveDirectoryReopenKeepsValidStateAndFiltersExpired(t *testing.T) {
+	reg, clk := newFakeRegistry(32)
+	valid, err := reg.Register(Instance{Service: "svc", ID: "valid", Addr: "keep"}, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.MarkReady("svc", "valid", valid.Token); err != nil {
+		t.Fatal(err)
+	}
+	expired, err := reg.Register(Instance{Service: "svc", ID: "expired", Addr: "drop"}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, err := reg.Register(Instance{Service: "svc", ID: "left", Addr: "gone"}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Deregister("svc", "left", left.Token); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "state")
+	if err := reg.SaveDirectory(dir); err != nil {
+		t.Fatal(err)
+	}
+	clk.Advance(1500 * time.Millisecond)
+
+	reopened, err := OpenDirectory(dir, WithClock(clk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.Version() != reg.Version()+1 {
+		t.Fatalf("version = %d, want %d", reopened.Version(), reg.Version()+1)
+	}
+	live := instanceMap(reopened.Snapshot().Instances)
+	if len(live) != 1 || live["/svc/valid"].State != StateReady {
+		t.Fatalf("live after reopen = %+v", live)
+	}
+	if _, err := reopened.Heartbeat("svc", "valid", valid.Token); err != nil {
+		t.Fatalf("valid token did not survive: %v", err)
+	}
+	if _, err := reopened.Heartbeat("svc", "expired", expired.Token); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired token resurrected entry: %v", err)
+	}
+	if rec, ok := reopened.Removal("svc", "expired"); !ok || rec.Reason != ReasonExpired {
+		t.Fatalf("expired audit = %+v ok=%v", rec, ok)
+	}
+	if rec, ok := reopened.Removal("svc", "left"); !ok || rec.Reason != ReasonDeregistered {
+		t.Fatalf("deregister audit = %+v ok=%v", rec, ok)
+	}
+	if _, err := os.Stat(filepath.Join(dir, stateFileName)); err != nil {
+		t.Fatalf("state file missing: %v", err)
+	}
+}
+
 // Concurrent renewal and registration must keep lease state and versions
 // consistent under the race detector.
 func TestConcurrentRenewalsAndRestarts(t *testing.T) {
@@ -282,7 +476,7 @@ func TestRunSweeperFakeClock(t *testing.T) {
 func mustToken(t *testing.T, reg *Registry, service, id string) string {
 	t.Helper()
 	reg.mu.Lock()
-	e, ok := reg.instances[key(service, id)]
+	e, ok := reg.instances[key(service, "", id)]
 	reg.mu.Unlock()
 	if !ok {
 		t.Fatal("instance missing")
