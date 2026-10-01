@@ -232,6 +232,9 @@ func (r *Registry) Register(inst Instance, lease time.Duration) (Registration, e
 	now := r.clock.Now()
 
 	r.mu.Lock()
+	// Expire any lapsed leases first so a registration can never interact
+	// with an entry that is already dead but not yet swept.
+	r.sweepExpiredLocked(now)
 	if old, ok := r.instances[k]; ok {
 		// A new incarnation supersedes the old one. The old holder can no
 		// longer renew anything; record the forced departure separately.
@@ -292,6 +295,9 @@ func (r *Registry) transition(service, id, token string, target State) (int64, e
 	now := r.clock.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// A lapsed lease cannot be brought back to life by a state change:
+	// expire it inline so readiness never outlives the lease.
+	r.sweepExpiredLocked(now)
 	e, ok := r.instances[k]
 	if !ok {
 		return 0, ErrNotFound
@@ -330,18 +336,13 @@ func (r *Registry) Heartbeat(service, id, token string) (deadline time.Time, err
 	now := r.clock.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.sweepExpiredLocked(now)
 	e, ok := r.instances[k]
 	if !ok {
 		return time.Time{}, ErrNotFound
 	}
 	if e.token != token {
 		return time.Time{}, ErrInvalidToken
-	}
-	if !now.Before(e.deadline) {
-		// The lease has lapsed but Sweep has not run yet. Do not grant an
-		// extension; expire it inline so the directory stays consistent.
-		r.expireLocked(k, e, now)
-		return time.Time{}, ErrNotFound
 	}
 	e.deadline = now.Add(e.lease)
 	return e.deadline, nil
@@ -354,6 +355,8 @@ func (r *Registry) Deregister(service, id, token string) error {
 	now := r.clock.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// A lapsed lease leaves as an expiry, not an explicit deregistration.
+	r.sweepExpiredLocked(now)
 	e, ok := r.instances[k]
 	if !ok {
 		return ErrNotFound
@@ -373,17 +376,26 @@ func (r *Registry) Sweep() []Change {
 	defer r.mu.Unlock()
 	startVersion := r.version
 	var swept []Change
-	for k, e := range r.instances {
-		if !now.Before(e.deadline) {
-			r.expireLocked(k, e, now)
-		}
-	}
+	r.sweepExpiredLocked(now)
 	for _, c := range r.log {
 		if c.Version > startVersion && c.Kind == ChangeExpired && c.At.Equal(now) {
 			swept = append(swept, c)
 		}
 	}
 	return swept
+}
+
+// sweepExpiredLocked expires every lease whose deadline has passed at now,
+// emitting the usual expired change events and audit records. Every public
+// operation runs it before reading or mutating the directory, so no code
+// path can observe or reactivate a dead registration merely because the
+// background sweeper has not run yet.
+func (r *Registry) sweepExpiredLocked(now time.Time) {
+	for k, e := range r.instances {
+		if !now.Before(e.deadline) {
+			r.expireLocked(k, e, now)
+		}
+	}
 }
 
 func (r *Registry) expireLocked(k string, e *entry, now time.Time) {
@@ -428,6 +440,7 @@ func (r *Registry) appendLocked(c Change) {
 func (r *Registry) Snapshot() Snapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.sweepExpiredLocked(r.clock.Now())
 	return *r.snapshotLockedScoped(nil)
 }
 
@@ -438,6 +451,7 @@ func (r *Registry) Snapshot() Snapshot {
 func (r *Registry) ReadyInstances(partitions ...string) []Instance {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.sweepExpiredLocked(r.clock.Now())
 	want := partitionSet(partitions)
 	out := make([]Instance, 0)
 	for _, e := range r.instances {
@@ -466,6 +480,7 @@ func (r *Registry) ReadyInstances(partitions ...string) []Instance {
 func (r *Registry) ChangesSince(fromVersion int64, partitions ...string) (ReadResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.sweepExpiredLocked(r.clock.Now())
 	want := partitionSet(partitions)
 	if fromVersion < 0 {
 		return ReadResult{}, fmt.Errorf("%w: negative version", ErrBadArgument)

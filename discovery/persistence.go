@@ -47,6 +47,9 @@ type stateFile struct {
 // instance back on reopen.
 func (r *Registry) Save(dir string) error {
 	r.mu.Lock()
+	// Persist only leases that are valid right now; a lapsed-but-unswept
+	// entry must not be written out and later revived.
+	r.sweepExpiredLocked(r.clock.Now())
 	img := stateFile{
 		Version:         r.version,
 		CompactedBefore: r.compactedBefore,

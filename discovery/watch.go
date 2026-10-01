@@ -55,6 +55,7 @@ func (r *Registry) watchLoop(ctx context.Context, fromVersion int64, want map[st
 	// the directory (and version) is currently empty.
 	if bootstrap {
 		r.mu.Lock()
+		r.sweepExpiredLocked(r.clock.Now())
 		snap := r.snapshotLockedScoped(want)
 		r.mu.Unlock()
 		if !r.deliver(ctx, ch, WatchEvent{
@@ -73,6 +74,9 @@ func (r *Registry) watchLoop(ctx context.Context, fromVersion int64, want map[st
 		}
 		// bootstrap: fall through once to drain events since the empty baseline.
 		bootstrap = false
+		// Observe lease validity before publishing anything: lapsed leases
+		// expire here so subscribers learn about them as change events.
+		r.sweepExpiredLocked(r.clock.Now())
 
 		var events []WatchEvent
 		switch {
