@@ -22,7 +22,7 @@ reg.Deregister(h.Instance.Service, h.Instance.ID, h.Token)
 ## 关键语义
 
 - 实例身份：每次登记返回随机租约 token。进程重启即新身份/新 token；旧进程的心跳、就绪切换、排空或退出都返回 `ErrInvalidToken`，不能续上新租约，旧 token 也不能挤掉新实例。
-- 租约：`Heartbeat` 在截止时间前移；超过截止时间后 `Sweep()` 或后台 `RunSweeper` 将其标记为 `expired`。主动退出标记为 `deregistered`，两者在变更事件和 `Removal` 审计记录中分开保存。
+- 租约：`Heartbeat` 在截止时间前移；超过截止时间后 `Sweep()` 或后台 `RunSweeper` 将其标记为 `expired`。租约有效性不依赖清理先运行：`SetReady`/`Drain`/`Heartbeat`/`Deregister` 在租约已过期时当场补记 `expired` 并拒绝操作，`ReadyInstances`/`Snapshot`/`ChangesSince`/`Subscribe`/`Save` 查询时刻也会先内联过期，保证任何时刻读到的都是同一有效实例集合。主动退出标记为 `deregistered`，两者在变更事件和 `Removal` 审计记录中分开保存。
 - 版本：所有登记/退出产生目录内连续、单调递增的版本号。
 - 就绪状态：登记不等于可接收请求。实例依次经历 `preparing`、`ready`、`draining`：`SetReady` 产生就绪版本事件后才出现在 `ReadyInstances`，`Drain` 停止接流但保留租约；`ready`/`draining` 都是带版本的目录变更，排空后不能再回到就绪。
 - 分区：`Instance.Partition` 给实例分区，`Subscribe(ctx, version, partitions...)` 与 `ChangesSince(version, partitions...)` 可只订阅部分分区。所有分区共用同一全局单调版本；慢订阅者错过保留窗口时拿到的是其分区在**单一一致版本**上的完整快照，不会把不同分区的旧增量拼在一起。

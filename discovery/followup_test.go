@@ -144,6 +144,75 @@ func idFor(i int) string {
 	return "f" + string(rune('a'+i%26)) + string(rune('a'+(i/26)%26))
 }
 
+// A lease that has lapsed but not yet been swept must not be reactivated by
+// readiness transitions, and reads must not report it as available. Expiry
+// is enforced inline at the moment of the operation, not whenever the
+// background sweeper happens to run.
+func TestLapsedLeaseCannotBecomeReady(t *testing.T) {
+	reg, clk := newFakeRegistry(16)
+	h, _ := reg.Register(Instance{Service: "s", ID: "a", Addr: "x", Partition: "p"}, time.Second)
+
+	clk.Advance(2 * time.Second) // lease lapsed; no Sweep ran
+
+	if _, err := reg.SetReady("s", "a", h.Token); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ready on lapsed lease err = %v", err)
+	}
+	if got := reg.ReadyInstances("p"); len(got) != 0 {
+		t.Fatalf("lapsed instance routable: %+v", got)
+	}
+	if rec, ok := reg.Removal("s", "a"); !ok || rec.Reason != ReasonExpired {
+		t.Fatalf("lapsed instance not expired inline: %+v ok=%v", rec, ok)
+	}
+
+	// Re-register after expiry: the new incarnation is a fresh identity and
+	// late requests carrying the old token must not affect it.
+	h2, err := reg.Register(Instance{Service: "s", ID: "a", Addr: "y", Partition: "p"}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h2.Token == h.Token {
+		t.Fatal("re-registration reused token")
+	}
+	if _, err := reg.SetReady("s", "a", h.Token); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("late ready with old token err = %v", err)
+	}
+	if _, err := reg.Heartbeat("s", "a", h.Token); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("late heartbeat with old token err = %v", err)
+	}
+	if _, err := reg.SetReady("s", "a", h2.Token); err != nil {
+		t.Fatalf("new incarnation ready: %v", err)
+	}
+	if got := reg.ReadyInstances("p"); len(got) != 1 || got[0].Addr != "y" {
+		t.Fatalf("ready set = %+v", got)
+	}
+}
+
+// Queries (ready set, snapshot, incremental reads) must all observe the same
+// effective instance set even while lapsed leases are still unswept.
+func TestQueriesAgreeOnEffectiveSet(t *testing.T) {
+	reg, clk := newFakeRegistry(16)
+	live, _ := reg.Register(Instance{Service: "s", ID: "live", Partition: "p"}, time.Minute)
+	reg.Register(Instance{Service: "s", ID: "stale", Partition: "p"}, time.Second)
+	reg.SetReady("s", "live", live.Token)
+
+	clk.Advance(2 * time.Second) // stale lapsed, sweeper idle
+
+	if got := reg.ReadyInstances("p"); len(got) != 1 || got[0].ID != "live" {
+		t.Fatalf("ready = %+v", got)
+	}
+	if snap := reg.Snapshot(); len(snap.Instances) != 1 || snap.Instances[0].ID != "live" {
+		t.Fatalf("snapshot = %+v", snap)
+	}
+	res, err := reg.ChangesSince(0, "p")
+	if err != nil || res.Snapshot == nil || len(res.Snapshot.Instances) != 1 ||
+		res.Snapshot.Instances[0].ID != "live" {
+		t.Fatalf("partition resync = %+v err=%v", res, err)
+	}
+	if rec, ok := reg.Removal("s", "stale"); !ok || rec.Reason != ReasonExpired {
+		t.Fatalf("stale audit = %+v ok=%v", rec, ok)
+	}
+}
+
 // Renew, restart, explicit leave and drain racing at one instant must leave
 // exactly one live incarnation and invalidate every old token.
 func TestConcurrentRestartDrainLeave(t *testing.T) {

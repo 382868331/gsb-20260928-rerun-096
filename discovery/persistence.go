@@ -47,6 +47,10 @@ type stateFile struct {
 // instance back on reopen.
 func (r *Registry) Save(dir string) error {
 	r.mu.Lock()
+	// Persist only leases that are still effective at save time; lapsed
+	// leases are expired inline (with events and audit) instead of being
+	// written as live entries.
+	r.expireStaleLocked(r.clock.Now())
 	img := stateFile{
 		Version:         r.version,
 		CompactedBefore: r.compactedBefore,

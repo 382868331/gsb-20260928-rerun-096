@@ -55,6 +55,7 @@ func (r *Registry) watchLoop(ctx context.Context, fromVersion int64, want map[st
 	// the directory (and version) is currently empty.
 	if bootstrap {
 		r.mu.Lock()
+		r.expireStaleLocked(r.clock.Now())
 		snap := r.snapshotLockedScoped(want)
 		r.mu.Unlock()
 		if !r.deliver(ctx, ch, WatchEvent{
@@ -82,6 +83,7 @@ func (r *Registry) watchLoop(ctx context.Context, fromVersion int64, want map[st
 		case last > 0 && last < r.oldestVersionLocked():
 			// History was compacted: resync from a full snapshot. This is the
 			// only way to catch up, so no event range can be skipped.
+			r.expireStaleLocked(r.clock.Now())
 			snap := r.snapshotLockedScoped(want)
 			r.mu.Unlock()
 			if !r.deliver(ctx, ch, WatchEvent{Version: snap.Version, Snapshot: snap}) {

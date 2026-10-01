@@ -299,6 +299,13 @@ func (r *Registry) transition(service, id, token string, target State) (int64, e
 	if e.token != token {
 		return 0, ErrInvalidToken
 	}
+	if !now.Before(e.deadline) {
+		// The lease has lapsed but Sweep has not run yet. A state change
+		// must not make the registration effective again; expire it inline
+		// so the directory stays consistent.
+		r.expireLocked(k, e, now)
+		return 0, ErrNotFound
+	}
 	current := e.stateLocked()
 	if current == target {
 		return r.version, nil
@@ -361,6 +368,12 @@ func (r *Registry) Deregister(service, id, token string) error {
 	if e.token != token {
 		return ErrInvalidToken
 	}
+	if !now.Before(e.deadline) {
+		// The lease already lapsed: record the departure as an expiry, not
+		// an explicit leave, so the audit trail reflects what happened.
+		r.expireLocked(k, e, now)
+		return ErrNotFound
+	}
 	r.removeLocked(k, e, ReasonDeregistered, now)
 	return nil
 }
@@ -373,17 +386,24 @@ func (r *Registry) Sweep() []Change {
 	defer r.mu.Unlock()
 	startVersion := r.version
 	var swept []Change
-	for k, e := range r.instances {
-		if !now.Before(e.deadline) {
-			r.expireLocked(k, e, now)
-		}
-	}
+	r.expireStaleLocked(now)
 	for _, c := range r.log {
 		if c.Version > startVersion && c.Kind == ChangeExpired && c.At.Equal(now) {
 			swept = append(swept, c)
 		}
 	}
 	return swept
+}
+
+// expireStaleLocked expires every lease whose deadline has passed. Read and
+// query paths call it so the effective instance set never depends on the
+// background sweeper having run first.
+func (r *Registry) expireStaleLocked(now time.Time) {
+	for k, e := range r.instances {
+		if !now.Before(e.deadline) {
+			r.expireLocked(k, e, now)
+		}
+	}
 }
 
 func (r *Registry) expireLocked(k string, e *entry, now time.Time) {
@@ -428,6 +448,7 @@ func (r *Registry) appendLocked(c Change) {
 func (r *Registry) Snapshot() Snapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.expireStaleLocked(r.clock.Now())
 	return *r.snapshotLockedScoped(nil)
 }
 
@@ -438,6 +459,7 @@ func (r *Registry) Snapshot() Snapshot {
 func (r *Registry) ReadyInstances(partitions ...string) []Instance {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.expireStaleLocked(r.clock.Now())
 	want := partitionSet(partitions)
 	out := make([]Instance, 0)
 	for _, e := range r.instances {
@@ -466,6 +488,7 @@ func (r *Registry) ReadyInstances(partitions ...string) []Instance {
 func (r *Registry) ChangesSince(fromVersion int64, partitions ...string) (ReadResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.expireStaleLocked(r.clock.Now())
 	want := partitionSet(partitions)
 	if fromVersion < 0 {
 		return ReadResult{}, fmt.Errorf("%w: negative version", ErrBadArgument)
