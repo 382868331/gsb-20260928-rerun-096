@@ -39,6 +39,13 @@ type stateFile struct {
 	Entries         []onDiskEntry   `json:"entries"`
 	Log             []Change        `json:"log"`
 	Removals        []RemovalRecord `json:"removals"`
+	// Selections and Sessions preserve the explainable selection history
+	// so reopening the directory keeps selection grounds and invalidation
+	// reasons consistent.
+	Selections    []Selection    `json:"selections,omitempty"`
+	Sessions      []sessionState `json:"sessions,omitempty"`
+	NextSessionID int64          `json:"next_session_id,omitempty"`
+	NextSelectID  int64          `json:"next_select_id,omitempty"`
 }
 
 // Save atomically persists the live directory, including readiness state,
@@ -56,6 +63,8 @@ func (r *Registry) Save(dir string) error {
 		CompactedBefore: r.compactedBefore,
 		Log:             append([]Change(nil), r.log...),
 		Removals:        make([]RemovalRecord, 0, len(r.removals)),
+		NextSessionID:   r.nextSessionID,
+		NextSelectID:    r.nextSelectID,
 	}
 	for _, e := range r.instances {
 		img.Entries = append(img.Entries, onDiskEntry{
@@ -67,6 +76,12 @@ func (r *Registry) Save(dir string) error {
 	}
 	for _, rec := range r.removals {
 		img.Removals = append(img.Removals, rec)
+	}
+	for _, sel := range r.selections {
+		img.Selections = append(img.Selections, *sel)
+	}
+	for _, sess := range r.sessions {
+		img.Sessions = append(img.Sessions, *sess)
 	}
 	r.mu.Unlock()
 
@@ -122,6 +137,16 @@ func OpenRegistry(dir string, opts ...Option) (*Registry, error) {
 	r.log = append([]Change(nil), img.Log...)
 	for _, rec := range img.Removals {
 		r.removals[key(rec.Instance.Service, rec.Instance.ID)] = rec
+	}
+	r.nextSessionID = img.NextSessionID
+	r.nextSelectID = img.NextSelectID
+	for i := range img.Selections {
+		sel := img.Selections[i]
+		r.selections[sel.ID] = &sel
+	}
+	for i := range img.Sessions {
+		sess := img.Sessions[i]
+		r.sessions[sess.ID] = &sess
 	}
 	var lapsed []onDiskEntry
 	for _, de := range img.Entries {

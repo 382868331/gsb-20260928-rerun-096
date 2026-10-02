@@ -43,6 +43,17 @@ const (
 	ChangeDraining     ChangeKind = "draining"
 )
 
+// ChangeMetadata is committed when a live instance updates its metadata.
+const ChangeMetadata ChangeKind = "metadata"
+
+// Well-known metadata keys used by client selection.
+const (
+	// MetaCapability marks what a client requires from an instance.
+	MetaCapability = "capability"
+	// MetaRegion marks the instance region for preference-based selection.
+	MetaRegion = "region"
+)
+
 // Instance is the addressable unit published by a virtual service.
 type Instance struct {
 	// Service groups instances that serve the same virtual service name.
@@ -168,6 +179,13 @@ type Registry struct {
 	// removals keeps an audit trail of how instances left (expiry vs explicit
 	// deregister), keyed by service + "\x00" + id.
 	removals map[string]RemovalRecord
+	// selections and sessions hold the explainable client-selection history.
+	// Selection records are immutable once committed; a session only points
+	// at them, so later conditions never rewrite older records.
+	selections    map[int64]*Selection
+	sessions      map[int64]*sessionState
+	nextSessionID int64
+	nextSelectID  int64
 }
 
 // RemovalRecord captures a departure, distinguishing lease failure from an
@@ -182,10 +200,12 @@ type RemovalRecord struct {
 // NewRegistry builds an empty registry.
 func NewRegistry(opts ...Option) *Registry {
 	r := &Registry{
-		clock:     WallClock{},
-		retention: 256,
-		instances: make(map[string]*entry),
-		removals:  make(map[string]RemovalRecord),
+		clock:      WallClock{},
+		retention:  256,
+		instances:  make(map[string]*entry),
+		removals:   make(map[string]RemovalRecord),
+		selections: make(map[int64]*Selection),
+		sessions:   make(map[int64]*sessionState),
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -326,6 +346,32 @@ func (r *Registry) transition(service, id, token string, target State) (int64, e
 		kind = ChangeDraining
 	}
 	r.appendLocked(Change{Kind: kind, Instance: cloneInst(e.inst), At: now})
+	return r.version, nil
+}
+
+// UpdateMetadata replaces the metadata of a live incarnation. Capability or
+// region changes are versioned directory events, so selection sessions can
+// explain why a previously adopted instance no longer matches. The token
+// must match the active incarnation, and a lapsed lease is expired inline
+// instead of being updated.
+func (r *Registry) UpdateMetadata(service, id, token string, meta map[string]string) (int64, error) {
+	k := key(service, id)
+	now := r.clock.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.instances[k]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	if e.token != token {
+		return 0, ErrInvalidToken
+	}
+	if !now.Before(e.deadline) {
+		r.expireLocked(k, e, now)
+		return 0, ErrNotFound
+	}
+	e.inst.Metadata = cloneMeta(meta)
+	r.appendLocked(Change{Kind: ChangeMetadata, Instance: cloneInst(e.inst), At: now})
 	return r.version, nil
 }
 

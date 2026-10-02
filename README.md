@@ -30,6 +30,7 @@ reg.Deregister(h.Instance.Service, h.Instance.ID, h.Token)
 - 推送订阅：`Subscribe(ctx, version)` 先给基线（或落后时的快照），再推送后续变化；断线重连时传入最后完整处理的版本即可。
 - 持久化：`Save(dir)` 原子落盘租约、就绪状态、保留事件与离职审计；`OpenRegistry(dir, ...)` 重开时恢复仍然有效的租约与状态，版本继续单调增长。打开时已到截止时间的实例不会复活，而是补记 `expired` 事件与审计，因此恢复旧文件不能让过期实例重新上线。
 - 可控时钟：`FakeClock` 支持冻结时间和手动 `Advance`，定时器只随时钟推进触发，用于确定性地验证续租、重连、扫描与重启一致性。
+- 可解释选择会话：`BeginSelection(SelectionQuery)` 按所需能力（`Metadata["capability"]`）、偏好区域（`Metadata["region"]`）与最低可用实例数评估本地登记实例，每个候选都带采用/排除原因，记录钉在评估时的目录版本上。会话期间实例过期、退出或能力变化（`UpdateMetadata`）时，`View` 区分原选择记录与此刻仍可用的实例及各自失效原因；`Evaluate`/`Confirm` 切换到新结果，`Defer` 暂缓并保留当前条件无法满足的原因。所有选择记录不可变并随 `Save`/`OpenRegistry` 持久化，`CompareSelections` 区分两次选择的差异来自实例状态还是用户条件。
 
 ## 测试
 
