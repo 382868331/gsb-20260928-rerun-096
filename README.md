@@ -29,6 +29,10 @@ reg.Deregister(h.Instance.Service, h.Instance.ID, h.Token)
 - 增量订阅：`ChangesSince(version)` 返回该版本之后的变化。版本 0 或已被压缩时返回完整 `Snapshot`；落后太多的订阅者必须以快照重建本地目录，不会拿到被截断的事件流。
 - 推送订阅：`Subscribe(ctx, version)` 先给基线（或落后时的快照），再推送后续变化；断线重连时传入最后完整处理的版本即可。
 - 持久化：`Save(dir)` 原子落盘租约、就绪状态、保留事件与离职审计；`OpenRegistry(dir, ...)` 重开时恢复仍然有效的租约与状态，版本继续单调增长。打开时已到截止时间的实例不会复活，而是补记 `expired` 事件与审计，因此恢复旧文件不能让过期实例重新上线。
+- 能力变更：`UpdateMetadata(service, id, token, meta)` 在不换身份的前提下原地更新元数据（如 `capabilities`、`region`），产生带版本的 `updated` 变更事件；同样需要当前租约 token，租约已过期则当场补记 `expired` 并拒绝。
+- 可解释选择会话：`NewSelectionSession(Criteria{Service, Capabilities, PreferredRegion, MinAvailable})` 开启一次客户端选择会话。每条 `Selection` 记录保存当时的目录版本与完整快照（`Basis`）、每个实例被采用或排除的原因（`Verdicts`）、按偏好区域排序的选中集（`Picked`），以及条件不满足时的 `Shortfall` 说明。能力与区域来自实例元数据键 `capabilities`（逗号分隔）与 `region`；选择只读取本地目录，不向真实服务发请求。
+- 会话演进：`Recheck()`/`RecheckWith(新条件)` 针对当前目录给出候选选择，并把已确认记录中失效的实例列入 `Stale`（区分 `lease expired`、`deregistered`、能力缺失、未就绪），失效实例不会出现在候选可用集中；`Confirm()` 才切换到候选并追加进不可变历史，暂缓切换则保留原记录与短缺原因。目录重开后失效原因一致，因为离职审计随 `Save` 持久化。
+- 选择比较：`CompareSelections(a, b)` 说明两次选择的差异来自实例状态变化（`Lost`/`Gained` 及每个实例的原因）还是用户条件变化（`CriteriaChanges`）；历史记录只增不改，新条件不会补写进旧记录。
 - 可控时钟：`FakeClock` 支持冻结时间和手动 `Advance`，定时器只随时钟推进触发，用于确定性地验证续租、重连、扫描与重启一致性。
 
 ## 测试

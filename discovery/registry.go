@@ -41,6 +41,10 @@ const (
 	ChangeExpired      ChangeKind = "expired"
 	ChangeReady        ChangeKind = "ready"
 	ChangeDraining     ChangeKind = "draining"
+	// ChangeUpdated marks an in-place metadata update of a live
+	// incarnation (e.g. a capability change announced without
+	// re-registering).
+	ChangeUpdated ChangeKind = "updated"
 )
 
 // Instance is the addressable unit published by a virtual service.
@@ -326,6 +330,32 @@ func (r *Registry) transition(service, id, token string, target State) (int64, e
 		kind = ChangeDraining
 	}
 	r.appendLocked(Change{Kind: kind, Instance: cloneInst(e.inst), At: now})
+	return r.version, nil
+}
+
+// UpdateMetadata replaces the metadata of a live incarnation in place,
+// producing a versioned ChangeUpdated event. It is how a holder announces a
+// capability or region change without re-registering (which would create a
+// new identity). Like every mutation it requires the current lease token
+// and expires the lease inline if it has already lapsed.
+func (r *Registry) UpdateMetadata(service, id, token string, meta map[string]string) (int64, error) {
+	k := key(service, id)
+	now := r.clock.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.instances[k]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	if e.token != token {
+		return 0, ErrInvalidToken
+	}
+	if !now.Before(e.deadline) {
+		r.expireLocked(k, e, now)
+		return 0, ErrNotFound
+	}
+	e.inst.Metadata = cloneMeta(meta)
+	r.appendLocked(Change{Kind: ChangeUpdated, Instance: cloneInst(e.inst), At: now})
 	return r.version, nil
 }
 
