@@ -147,6 +147,21 @@ type Recheck struct {
 	// CriteriaChanged reports whether the candidate used different
 	// conditions than the confirmed selection.
 	CriteriaChanged bool
+	// Honorable is how many candidate picks the session could still
+	// reserve right now, given capacity already held by other sessions.
+	// A preview may look sufficient while Honorable is smaller; only
+	// reserved or confirmed capacity is actually guaranteed.
+	Honorable int
+	// Guaranteed are confirmed picks whose capacity the session still
+	// holds confirmed and which remain usable right now.
+	Guaranteed []Instance
+	// LostGuarantee explains confirmed picks that currently lack a
+	// capacity guarantee (departed, capability lost, hold released or
+	// reservation expired).
+	LostGuarantee []StaleEntry
+	// Switch describes the capacity transition a Confirm would perform;
+	// nil for read-only sessions that never reserved capacity.
+	Switch *SwitchPlan
 }
 
 // SelectionDiff compares two selection records and attributes the
@@ -217,11 +232,21 @@ func CompareSelections(a, b Selection) SelectionDiff {
 type Session struct {
 	reg        *Registry
 	mu         sync.Mutex
+	id         string
 	seq        int64
 	current    Selection
 	history    []Selection
 	pending    *Selection
 	hasPending bool
+	// capacityAware is true once the session has reserved capacity; such
+	// sessions get guarantee reporting and degradation gates on Confirm.
+	capacityAware bool
+	// reservationID identifies the session's live reservation group.
+	reservationID string
+	// lastConfirm makes a duplicate Confirm return the same decision
+	// instead of failing, so retries never double-allocate capacity.
+	lastConfirm    Selection
+	hasLastConfirm bool
 }
 
 // NewSelectionSession starts a session and commits the first selection
@@ -230,7 +255,7 @@ func (r *Registry) NewSelectionSession(c Criteria) (*Session, error) {
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
-	s := &Session{reg: r}
+	s := &Session{reg: r, id: newToken()}
 	first := r.evaluate(c, 1)
 	s.seq = 1
 	s.current = first
@@ -308,22 +333,214 @@ func (s *Session) recheck(c Criteria) Recheck {
 			Reason:   s.reg.staleReason(inst, c, verdictByID[inst.ID]),
 		})
 	}
+	s.fillCapacityView(&rc, base, c, usable)
 	return rc
 }
 
-// Confirm switches the session to the pending candidate from the last
-// Recheck/RecheckWith and appends it to the immutable history. The previous
-// record is kept unchanged.
-func (s *Session) Confirm() (Selection, error) {
+// fillCapacityView annotates a recheck with the session's capacity
+// position: how many candidate picks remain honorable, which confirmed
+// picks are still guaranteed, and what a switch would do. Read-only
+// sessions only get the Honorable count.
+func (s *Session) fillCapacityView(rc *Recheck, base Selection, c Criteria, usable map[string]bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	aware := s.capacityAware
+	s.mu.Unlock()
+
+	s.reg.mu.Lock()
+	now := s.reg.clock.Now()
+	s.reg.expireStaleLocked(now)
+	for _, inst := range rc.Candidate.Picked {
+		if s.reg.hasConfirmedHoldLocked(s.id, inst.Service, inst.ID) ||
+			s.reg.freeCapacityLocked(inst, s.id) > 0 {
+			rc.Honorable++
+		}
+	}
+	if !aware {
+		s.reg.mu.Unlock()
+		return
+	}
+	confirmed := map[string]bool{}
+	for _, h := range s.reg.sessionHoldsLocked(s.id, HoldConfirmed) {
+		confirmed[h.InstanceID] = true
+	}
+	verdictByID := map[string]Verdict{}
+	for _, v := range rc.Candidate.Verdicts {
+		verdictByID[v.Instance.ID] = v
+	}
+	for _, inst := range base.Picked {
+		if confirmed[inst.ID] && usable[inst.ID] {
+			rc.Guaranteed = append(rc.Guaranteed, inst)
+			continue
+		}
+		reason := ""
+		switch {
+		case confirmed[inst.ID]:
+			reason = s.reg.staleReasonLocked(inst, c, verdictByID[inst.ID])
+		default:
+			if rec, gone := s.reg.removals[key(inst.Service, inst.ID)]; gone {
+				reason = departureReason(rec)
+			} else {
+				reason = "no capacity hold (reservation expired, cancelled or released)"
+			}
+		}
+		rc.LostGuarantee = append(rc.LostGuarantee, StaleEntry{Instance: inst, Reason: reason})
+	}
+	if len(confirmed) > 0 {
+		plan := &SwitchPlan{
+			OldReleaseAt:   "confirmed holds on instances outside the candidate are released when Confirm commits the switch",
+			NewEffectiveAt: "reserved capacity becomes confirmed usage at Confirm; unreserved units are acquired then if still free",
+		}
+		picked := map[string]bool{}
+		for _, inst := range rc.Candidate.Picked {
+			picked[inst.ID] = true
+		}
+		for _, h := range s.reg.sessionHoldsLocked(s.id, HoldConfirmed) {
+			if h.Service != c.Service || !picked[h.InstanceID] {
+				plan.Releasing = append(plan.Releasing, h.InstanceID)
+			}
+		}
+		sort.Strings(plan.Releasing)
+		plan.Uninterrupted = rc.Honorable >= c.MinAvailable
+		if !plan.Uninterrupted {
+			plan.Note = fmt.Sprintf(
+				"only %d of %d required instance(s) can be guaranteed after the switch; Confirm requires explicit degradation acceptance",
+				rc.Honorable, c.MinAvailable)
+		}
+		rc.Switch = plan
+	}
+	s.reg.mu.Unlock()
+}
+
+func departureReason(rec RemovalRecord) string {
+	switch rec.Reason {
+	case ReasonExpired:
+		return "lease expired"
+	case ReasonDeregistered:
+		return "deregistered"
+	}
+	return "left the directory"
+}
+
+// Confirm switches the session to the pending candidate from the last
+// Recheck/RecheckWith/Reserve and appends it to the immutable history. The
+// previous record is kept unchanged.
+//
+// For capacity-aware sessions Confirm also settles capacity: live reserved
+// holds become confirmed usage, a reservation that already lapsed is
+// re-acquired only if the capacity is still free (ErrCapacityUnavailable
+// otherwise, leaving the candidate pending), and confirmed holds on
+// instances outside the new selection are released. A switch that drops a
+// currently-satisfied session below its minimum is rejected with
+// ErrDegradationNeedsAccept unless the user explicitly accepts via
+// ConfirmAcceptingDegradation. Repeating Confirm after a successful one
+// returns the same decision without allocating anything again.
+func (s *Session) Confirm() (Selection, error) {
+	return s.confirm(false)
+}
+
+// ConfirmAcceptingDegradation is Confirm with an explicit user acceptance
+// of dropping below the minimum number of guaranteed instances.
+func (s *Session) ConfirmAcceptingDegradation() (Selection, error) {
+	return s.confirm(true)
+}
+
+func (s *Session) confirm(acceptDegradation bool) (Selection, error) {
+	s.mu.Lock()
 	if !s.hasPending {
+		if s.capacityAware && s.hasLastConfirm {
+			sel := s.lastConfirm
+			s.mu.Unlock()
+			return sel, nil
+		}
+		s.mu.Unlock()
 		return Selection{}, ErrNoPendingSelection
 	}
-	s.current = *s.pending
+	cand := *s.pending
+	aware := s.capacityAware
+	resID := s.reservationID
+	currentlySatisfied := s.current.Satisfied
+	s.mu.Unlock()
+
+	if aware {
+		if currentlySatisfied && !cand.Satisfied && !acceptDegradation {
+			return Selection{}, fmt.Errorf("%w: %s", ErrDegradationNeedsAccept, cand.Shortfall)
+		}
+		now := s.reg.clock.Now()
+		s.reg.mu.Lock()
+		s.reg.expireStaleLocked(now)
+		converted := false
+		if resID != "" {
+			for id, h := range s.reg.holds {
+				if h.SessionID == s.id && h.Kind == HoldReserved &&
+					strings.HasPrefix(id, resID+":") {
+					h.Kind = HoldConfirmed
+					h.ExpiresAt = time.Time{}
+					s.reg.holds[id] = h
+					converted = true
+				}
+			}
+		}
+		if !converted {
+			// No live reservation (expired, cancelled, or never made):
+			// acquire confirmed units only from still-free capacity.
+			var created []string
+			acquired := 0
+			for _, inst := range cand.Picked {
+				if _, live := s.reg.instances[key(inst.Service, inst.ID)]; !live {
+					continue
+				}
+				if s.reg.hasConfirmedHoldLocked(s.id, inst.Service, inst.ID) {
+					acquired++
+					continue
+				}
+				if s.reg.freeCapacityLocked(inst, s.id) <= 0 {
+					continue
+				}
+				hid := newToken()
+				s.reg.holds[hid] = Hold{
+					ID:         hid,
+					SessionID:  s.id,
+					Service:    inst.Service,
+					InstanceID: inst.ID,
+					Kind:       HoldConfirmed,
+					CreatedAt:  now,
+				}
+				created = append(created, hid)
+				acquired++
+			}
+			if acquired < cand.Criteria.MinAvailable && !acceptDegradation {
+				for _, hid := range created {
+					delete(s.reg.holds, hid)
+				}
+				s.reg.mu.Unlock()
+				return Selection{}, fmt.Errorf(
+					"%w: reservation is gone and only %d of %d required instance(s) still have free capacity",
+					ErrCapacityUnavailable, acquired, cand.Criteria.MinAvailable)
+			}
+		}
+		// The switch releases old confirmed occupancy outside the new set.
+		picked := map[string]bool{}
+		for _, inst := range cand.Picked {
+			picked[inst.ID] = true
+		}
+		for id, h := range s.reg.holds {
+			if h.SessionID == s.id && h.Kind == HoldConfirmed &&
+				(h.Service != cand.Criteria.Service || !picked[h.InstanceID]) {
+				delete(s.reg.holds, id)
+			}
+		}
+		s.reg.mu.Unlock()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.current = cand
 	s.history = append(s.history, s.current)
 	s.pending = nil
 	s.hasPending = false
+	s.reservationID = ""
+	s.lastConfirm = cand
+	s.hasLastConfirm = true
 	return s.current, nil
 }
 
@@ -405,16 +622,15 @@ func (r *Registry) evaluate(c Criteria, seq int64) Selection {
 // to the candidate verdict for live-but-ineligible instances.
 func (r *Registry) staleReason(inst Instance, c Criteria, v Verdict) string {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.staleReasonLocked(inst, c, v)
+}
+
+// staleReasonLocked is staleReason for callers already holding r.mu.
+func (r *Registry) staleReasonLocked(inst Instance, c Criteria, v Verdict) string {
 	rec, gone := r.removals[key(inst.Service, inst.ID)]
-	r.mu.Unlock()
 	if gone {
-		switch rec.Reason {
-		case ReasonExpired:
-			return "lease expired"
-		case ReasonDeregistered:
-			return "deregistered"
-		}
-		return "left the directory"
+		return departureReason(rec)
 	}
 	if len(v.Reasons) > 0 {
 		return strings.Join(v.Reasons, "; ")
