@@ -33,6 +33,11 @@ reg.Deregister(h.Instance.Service, h.Instance.ID, h.Token)
 - 可解释选择会话：`NewSelectionSession(Criteria{Service, Capabilities, PreferredRegion, MinAvailable})` 开启一次客户端选择会话。每条 `Selection` 记录保存当时的目录版本与完整快照（`Basis`）、每个实例被采用或排除的原因（`Verdicts`）、按偏好区域排序的选中集（`Picked`），以及条件不满足时的 `Shortfall` 说明。能力与区域来自实例元数据键 `capabilities`（逗号分隔）与 `region`；选择只读取本地目录，不向真实服务发请求。
 - 会话演进：`Recheck()`/`RecheckWith(新条件)` 针对当前目录给出候选选择，并把已确认记录中失效的实例列入 `Stale`（区分 `lease expired`、`deregistered`、能力缺失、未就绪），失效实例不会出现在候选可用集中；`Confirm()` 才切换到候选并追加进不可变历史，暂缓切换则保留原记录与短缺原因。目录重开后失效原因一致，因为离职审计随 `Save` 持久化。
 - 选择比较：`CompareSelections(a, b)` 说明两次选择的差异来自实例状态变化（`Lost`/`Gained` 及每个实例的原因）还是用户条件变化（`CriteriaChanges`）；历史记录只增不改，新条件不会补写进旧记录。
+- 有限容量与预留：实例元数据键 `capacity`（整数，缺省为 1，非法或负数视为 0）表示可同时承载的容量单位；每个单位同一时刻只能归一个会话所有。只读 `Recheck` 仍然只做预览，但会在 `Honorable` 中说明候选里此刻还能兑现多少实例；只有预留或已确认的容量才算保障，多个会话不会把同一份容量各自当成可用。
+- 预留生命周期：`Reserve(ttl)` 针对候选选择暂时持有容量并给出到期时间；有效期内 `Confirm()` 转为已确认使用，`CancelReservation()` 提前释放，不确认则到期自动失效。重复确认回放同一次决定、不重复占用；重复取消不多释放。`ReleaseConfirmed()` 显式归还已确认容量。
+- 保障失效：租约到期、主动退出、旧化身重登或能力减少时，历史选择记录与占用事实保留不变；`Recheck` 的 `Guaranteed` 只列出当前仍受保障的已确认实例，`LostGuarantee` 逐个说明失去保障的范围与原因。任何会话的最低数量都不会挪用别的会话已确认的容量。
+- 替换与不中断：容量感知会话的 `Recheck` 返回 `Switch` 计划，说明确认切换时旧占用何时释放、新预留在何时生效，以及切换后是否仍满足最低数量（`Uninterrupted`）；会降到最低数量以下时 `Confirm()` 返回 `ErrDegradationNeedsAccept`，必须由 `ConfirmAcceptingDegradation()` 明确接受降级，否则保留原占用不切换。
+- 恢复一致性：`Save`/`OpenRegistry` 持久化存活的容量归属；重开后已到期的预留不会复活，已确认占用继续有效。客户端可用 `ResumeSelectionSession(id, criteria)` 以原会话 ID 恢复，恢复后收到重复的确认/取消通知仍然幂等，同一份容量不会出现互相矛盾的归属。未调用过 `Reserve` 的只读选择会话行为完全不变。
 - 可控时钟：`FakeClock` 支持冻结时间和手动 `Advance`，定时器只随时钟推进触发，用于确定性地验证续租、重连、扫描与重启一致性。
 
 ## 测试

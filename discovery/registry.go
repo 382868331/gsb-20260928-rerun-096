@@ -172,6 +172,10 @@ type Registry struct {
 	// removals keeps an audit trail of how instances left (expiry vs explicit
 	// deregister), keyed by service + "\x00" + id.
 	removals map[string]RemovalRecord
+	// holds tracks capacity ownership per session, keyed by hold ID. It is
+	// the single source of truth for which session owns which capacity
+	// unit, so concurrent sessions can never own the same unit.
+	holds map[string]Hold
 }
 
 // RemovalRecord captures a departure, distinguishing lease failure from an
@@ -190,6 +194,7 @@ func NewRegistry(opts ...Option) *Registry {
 		retention: 256,
 		instances: make(map[string]*entry),
 		removals:  make(map[string]RemovalRecord),
+		holds:     make(map[string]Hold),
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -251,6 +256,8 @@ func (r *Registry) Register(inst Instance, lease time.Duration) (Registration, e
 			At:       now,
 			Version:  r.version,
 		}
+		// Capacity held on the old incarnation does not transfer.
+		r.dropHoldsForLocked(old.inst.Service, old.inst.ID)
 	}
 	token := newToken()
 	e := &entry{
@@ -434,6 +441,7 @@ func (r *Registry) expireStaleLocked(now time.Time) {
 			r.expireLocked(k, e, now)
 		}
 	}
+	r.expireHoldsLocked(now)
 }
 
 func (r *Registry) expireLocked(k string, e *entry, now time.Time) {
@@ -442,6 +450,7 @@ func (r *Registry) expireLocked(k string, e *entry, now time.Time) {
 
 func (r *Registry) removeLocked(k string, e *entry, reason Reason, now time.Time) {
 	delete(r.instances, k)
+	r.dropHoldsForLocked(e.inst.Service, e.inst.ID)
 	kind := ChangeDeregistered
 	if reason == ReasonExpired {
 		kind = ChangeExpired

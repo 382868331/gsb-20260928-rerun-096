@@ -39,6 +39,9 @@ type stateFile struct {
 	Entries         []onDiskEntry   `json:"entries"`
 	Log             []Change        `json:"log"`
 	Removals        []RemovalRecord `json:"removals"`
+	// Holds persists live capacity holds so a reopened directory cannot
+	// hand already-owned capacity to another session.
+	Holds []Hold `json:"holds,omitempty"`
 }
 
 // Save atomically persists the live directory, including readiness state,
@@ -67,6 +70,9 @@ func (r *Registry) Save(dir string) error {
 	}
 	for _, rec := range r.removals {
 		img.Removals = append(img.Removals, rec)
+	}
+	for _, h := range r.holds {
+		img.Holds = append(img.Holds, h)
 	}
 	r.mu.Unlock()
 
@@ -122,6 +128,14 @@ func OpenRegistry(dir string, opts ...Option) (*Registry, error) {
 	r.log = append([]Change(nil), img.Log...)
 	for _, rec := range img.Removals {
 		r.removals[key(rec.Instance.Service, rec.Instance.ID)] = rec
+	}
+	for _, h := range img.Holds {
+		// Reserved holds that lapsed while the directory was down are
+		// dropped, never revived; confirmed holds carry no expiry.
+		if h.Kind == HoldReserved && !now.Before(h.ExpiresAt) {
+			continue
+		}
+		r.holds[h.ID] = h
 	}
 	var lapsed []onDiskEntry
 	for _, de := range img.Entries {
