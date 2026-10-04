@@ -119,7 +119,17 @@ type Selection struct {
 	Verdicts []Verdict
 	// Picked are the adopted instances, preferred region first, then by ID.
 	Picked []Instance
-	// Satisfied reports whether len(Picked) >= Criteria.MinAvailable.
+	// CandidatePicked is the complete candidate set for a capacity-aware
+	// decision. Picked is narrowed to capacity actually owned after
+	// Confirm when the candidate could only be partially honored.
+	CandidatePicked []Instance `json:"candidate_picked,omitempty"`
+	// Honored is the number of candidate instances backed by the session's
+	// own live capacity at decision time.
+	Honored int `json:"honored,omitempty"`
+	// Satisfied reports whether the owned Picked capacity meets the minimum.
+	// Capacity-aware confirmations can be unsatisfied only after the user
+	// explicitly accepts a degradation; CandidatePicked preserves the full
+	// request so Picked remains the actual deliverable set.
 	Satisfied bool
 	// Shortfall explains why the criteria cannot be met, empty when
 	// Satisfied is true.
@@ -249,6 +259,100 @@ type Session struct {
 	hasLastConfirm bool
 }
 
+type persistedSession struct {
+	ID             string      `json:"id"`
+	Seq            int64       `json:"seq"`
+	Current        Selection   `json:"current"`
+	History        []Selection `json:"history"`
+	Pending        *Selection  `json:"pending,omitempty"`
+	HasPending     bool        `json:"has_pending"`
+	CapacityAware  bool        `json:"capacity_aware"`
+	ReservationID  string      `json:"reservation_id,omitempty"`
+	LastConfirm    Selection   `json:"last_confirm"`
+	HasLastConfirm bool        `json:"has_last_confirm"`
+}
+
+func (s *Session) snapshotStateLocked() persistedSession {
+	return persistedSession{
+		ID:             s.id,
+		Seq:            s.seq,
+		Current:        cloneSelection(s.current),
+		History:        cloneSelections(s.history),
+		Pending:        cloneSelectionPtr(s.pending),
+		HasPending:     s.hasPending,
+		CapacityAware:  s.capacityAware,
+		ReservationID:  s.reservationID,
+		LastConfirm:    cloneSelection(s.lastConfirm),
+		HasLastConfirm: s.hasLastConfirm,
+	}
+}
+
+func (s *Session) persistState() {
+	s.mu.Lock()
+	state := s.snapshotStateLocked()
+	s.reg.mu.Lock()
+	s.reg.sessions[state.ID] = state
+	s.reg.mu.Unlock()
+	s.mu.Unlock()
+}
+
+func (s *Session) restoreStateLocked(state persistedSession) {
+	s.id = state.ID
+	s.seq = state.Seq
+	s.current = cloneSelection(state.Current)
+	s.history = cloneSelections(state.History)
+	s.pending = cloneSelectionPtr(state.Pending)
+	s.hasPending = state.HasPending
+	s.capacityAware = state.CapacityAware
+	s.reservationID = state.ReservationID
+	s.lastConfirm = cloneSelection(state.LastConfirm)
+	s.hasLastConfirm = state.HasLastConfirm
+}
+
+func cloneSelectionPtr(in *Selection) *Selection {
+	if in == nil {
+		return nil
+	}
+	out := cloneSelection(*in)
+	return &out
+}
+
+func cloneSelections(in []Selection) []Selection {
+	if in == nil {
+		return nil
+	}
+	out := make([]Selection, len(in))
+	for i := range in {
+		out[i] = cloneSelection(in[i])
+	}
+	return out
+}
+
+func cloneSelection(in Selection) Selection {
+	out := in
+	out.Criteria.Capabilities = append([]string(nil), in.Criteria.Capabilities...)
+	out.Basis.Instances = cloneInstances(in.Basis.Instances)
+	out.Verdicts = append([]Verdict(nil), in.Verdicts...)
+	for i := range out.Verdicts {
+		out.Verdicts[i].Instance = cloneInst(in.Verdicts[i].Instance)
+		out.Verdicts[i].Reasons = append([]string(nil), in.Verdicts[i].Reasons...)
+	}
+	out.Picked = cloneInstances(in.Picked)
+	out.CandidatePicked = cloneInstances(in.CandidatePicked)
+	return out
+}
+
+func cloneInstances(in []Instance) []Instance {
+	if in == nil {
+		return nil
+	}
+	out := make([]Instance, len(in))
+	for i := range in {
+		out[i] = cloneInst(in[i])
+	}
+	return out
+}
+
 // NewSelectionSession starts a session and commits the first selection
 // computed from the current directory state.
 func (r *Registry) NewSelectionSession(c Criteria) (*Session, error) {
@@ -260,6 +364,7 @@ func (r *Registry) NewSelectionSession(c Criteria) (*Session, error) {
 	s.seq = 1
 	s.current = first
 	s.history = append(s.history, first)
+	s.persistState()
 	return s, nil
 }
 
@@ -306,10 +411,13 @@ func (s *Session) recheck(c Criteria) Recheck {
 	s.mu.Lock()
 	base := s.current
 	s.seq++
-	cand := s.reg.evaluate(c, s.seq)
+	seq := s.seq
+	aware := s.capacityAware
+	s.reg.mu.Lock()
+	cand := s.reg.evaluateLocked(c, seq)
 	s.pending = &cand
 	s.hasPending = true
-	s.mu.Unlock()
+	s.reg.sessions[s.id] = s.snapshotStateLocked()
 
 	rc := Recheck{
 		Candidate:       cand,
@@ -330,10 +438,12 @@ func (s *Session) recheck(c Criteria) Recheck {
 		}
 		rc.Stale = append(rc.Stale, StaleEntry{
 			Instance: inst,
-			Reason:   s.reg.staleReason(inst, c, verdictByID[inst.ID]),
+			Reason:   s.reg.staleReasonLocked(inst, c, verdictByID[inst.ID]),
 		})
 	}
-	s.fillCapacityView(&rc, base, c, usable)
+	s.fillCapacityViewLocked(&rc, base, c, usable, aware)
+	s.reg.mu.Unlock()
+	s.mu.Unlock()
 	return rc
 }
 
@@ -341,12 +451,7 @@ func (s *Session) recheck(c Criteria) Recheck {
 // position: how many candidate picks remain honorable, which confirmed
 // picks are still guaranteed, and what a switch would do. Read-only
 // sessions only get the Honorable count.
-func (s *Session) fillCapacityView(rc *Recheck, base Selection, c Criteria, usable map[string]bool) {
-	s.mu.Lock()
-	aware := s.capacityAware
-	s.mu.Unlock()
-
-	s.reg.mu.Lock()
+func (s *Session) fillCapacityViewLocked(rc *Recheck, base Selection, c Criteria, usable map[string]bool, aware bool) {
 	now := s.reg.clock.Now()
 	s.reg.expireStaleLocked(now)
 	for _, inst := range rc.Candidate.Picked {
@@ -356,7 +461,6 @@ func (s *Session) fillCapacityView(rc *Recheck, base Selection, c Criteria, usab
 		}
 	}
 	if !aware {
-		s.reg.mu.Unlock()
 		return
 	}
 	confirmed := map[string]bool{}
@@ -408,7 +512,6 @@ func (s *Session) fillCapacityView(rc *Recheck, base Selection, c Criteria, usab
 		}
 		rc.Switch = plan
 	}
-	s.reg.mu.Unlock()
 }
 
 func departureReason(rec RemovalRecord) string {
@@ -458,44 +561,88 @@ func (s *Session) confirm(acceptDegradation bool) (Selection, error) {
 	cand := *s.pending
 	aware := s.capacityAware
 	resID := s.reservationID
-	currentlySatisfied := s.current.Satisfied
 	s.mu.Unlock()
 
 	if aware {
-		if currentlySatisfied && !cand.Satisfied && !acceptDegradation {
-			return Selection{}, fmt.Errorf("%w: %s", ErrDegradationNeedsAccept, cand.Shortfall)
-		}
 		now := s.reg.clock.Now()
 		s.reg.mu.Lock()
 		s.reg.expireStaleLocked(now)
-		converted := false
-		if resID != "" {
-			for id, h := range s.reg.holds {
-				if h.SessionID == s.id && h.Kind == HoldReserved &&
-					strings.HasPrefix(id, resID+":") {
-					h.Kind = HoldConfirmed
-					h.ExpiresAt = time.Time{}
-					s.reg.holds[id] = h
-					converted = true
+		var plan []Instance
+		liveReservation := false
+		for _, inst := range cand.Picked {
+			if _, live := s.reg.instances[key(inst.Service, inst.ID)]; !live {
+				continue
+			}
+			if s.reg.hasConfirmedHoldLocked(s.id, inst.Service, inst.ID) {
+				plan = append(plan, inst)
+				continue
+			}
+			if resID != "" {
+				reservedID := resID + ":" + inst.ID
+				if h, ok := s.reg.holds[reservedID]; ok && h.Kind == HoldReserved &&
+					h.SessionID == s.id && h.Service == inst.Service {
+					liveReservation = true
+					plan = append(plan, inst)
+				}
+				continue
+			}
+		}
+		canAcquire := resID == "" || !liveReservation
+		if canAcquire {
+			planned := map[string]bool{}
+			for _, inst := range plan {
+				planned[inst.ID] = true
+			}
+			for _, inst := range cand.Picked {
+				if planned[inst.ID] {
+					continue
+				}
+				if _, live := s.reg.instances[key(inst.Service, inst.ID)]; live &&
+					s.reg.freeCapacityLocked(inst, s.id) > 0 {
+					plan = append(plan, inst)
 				}
 			}
 		}
-		if !converted {
-			// No live reservation (expired, cancelled, or never made):
-			// acquire confirmed units only from still-free capacity.
-			var created []string
-			acquired := 0
-			for _, inst := range cand.Picked {
-				if _, live := s.reg.instances[key(inst.Service, inst.ID)]; !live {
+		honored := len(plan)
+		if honored < cand.Criteria.MinAvailable {
+			if resID != "" && !liveReservation {
+				s.reg.mu.Unlock()
+				if honored == 0 {
+					return Selection{}, fmt.Errorf(
+						"%w: reservation is gone and only %d of %d required instance(s) still have free capacity",
+						ErrCapacityUnavailable, honored, cand.Criteria.MinAvailable)
+				}
+			} else if honored == 0 {
+				s.reg.mu.Unlock()
+				return Selection{}, fmt.Errorf(
+					"%w: only %d of %d required instance(s) have free capacity",
+					ErrCapacityUnavailable, honored, cand.Criteria.MinAvailable)
+			}
+			if !acceptDegradation {
+				s.reg.mu.Unlock()
+				return Selection{}, fmt.Errorf(
+					"%w: only %d of %d required instance(s) can be guaranteed; explicit acceptance required",
+					ErrDegradationNeedsAccept, honored, cand.Criteria.MinAvailable)
+			}
+		}
+
+		committedPicked := map[string]bool{}
+		for _, inst := range plan {
+			committedPicked[inst.ID] = true
+			if s.reg.hasConfirmedHoldLocked(s.id, inst.Service, inst.ID) {
+				continue
+			}
+			if canAcquire || liveReservation {
+				reservedID := resID + ":" + inst.ID
+				if h, ok := s.reg.holds[reservedID]; ok && h.Kind == HoldReserved &&
+					h.SessionID == s.id && h.Service == inst.Service {
+					h.Kind = HoldConfirmed
+					h.ExpiresAt = time.Time{}
+					s.reg.holds[reservedID] = h
 					continue
 				}
-				if s.reg.hasConfirmedHoldLocked(s.id, inst.Service, inst.ID) {
-					acquired++
-					continue
-				}
-				if s.reg.freeCapacityLocked(inst, s.id) <= 0 {
-					continue
-				}
+			}
+			if canAcquire && s.reg.freeCapacityLocked(inst, s.id) > 0 {
 				hid := newToken()
 				s.reg.holds[hid] = Hold{
 					ID:         hid,
@@ -505,35 +652,35 @@ func (s *Session) confirm(acceptDegradation bool) (Selection, error) {
 					Kind:       HoldConfirmed,
 					CreatedAt:  now,
 				}
-				created = append(created, hid)
-				acquired++
-			}
-			if acquired < cand.Criteria.MinAvailable && !acceptDegradation {
-				for _, hid := range created {
-					delete(s.reg.holds, hid)
-				}
-				s.reg.mu.Unlock()
-				return Selection{}, fmt.Errorf(
-					"%w: reservation is gone and only %d of %d required instance(s) still have free capacity",
-					ErrCapacityUnavailable, acquired, cand.Criteria.MinAvailable)
 			}
 		}
-		// The switch releases old confirmed occupancy outside the new set.
-		picked := map[string]bool{}
-		for _, inst := range cand.Picked {
-			picked[inst.ID] = true
-		}
+
 		for id, h := range s.reg.holds {
+			if h.SessionID == s.id && h.Kind == HoldReserved &&
+				(resID == "" || strings.HasPrefix(id, resID+":")) {
+				delete(s.reg.holds, id)
+			}
 			if h.SessionID == s.id && h.Kind == HoldConfirmed &&
-				(h.Service != cand.Criteria.Service || !picked[h.InstanceID]) {
+				(h.Service != cand.Criteria.Service || !committedPicked[h.InstanceID]) {
 				delete(s.reg.holds, id)
 			}
 		}
 		s.reg.mu.Unlock()
+
+		committed := cand
+		committed.CandidatePicked = cloneInstances(cand.Picked)
+		committed.Picked = cloneInstances(plan)
+		committed.Honored = honored
+		committed.Satisfied = committed.Honored >= committed.Criteria.MinAvailable
+		if !committed.Satisfied {
+			committed.Shortfall = fmt.Sprintf(
+				"only %d of %d required instance(s) are confirmed and usable",
+				committed.Honored, committed.Criteria.MinAvailable)
+		}
+		cand = committed
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.current = cand
 	s.history = append(s.history, s.current)
 	s.pending = nil
@@ -541,6 +688,10 @@ func (s *Session) confirm(acceptDegradation bool) (Selection, error) {
 	s.reservationID = ""
 	s.lastConfirm = cand
 	s.hasLastConfirm = true
+	s.reg.mu.Lock()
+	s.reg.sessions[s.id] = s.snapshotStateLocked()
+	s.reg.mu.Unlock()
+	s.mu.Unlock()
 	return s.current, nil
 }
 
@@ -551,6 +702,10 @@ func (s *Session) confirm(acceptDegradation bool) (Selection, error) {
 func (r *Registry) evaluate(c Criteria, seq int64) Selection {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.evaluateLocked(c, seq)
+}
+
+func (r *Registry) evaluateLocked(c Criteria, seq int64) Selection {
 	now := r.clock.Now()
 	r.expireStaleLocked(now)
 	basis := r.snapshotLocked()

@@ -42,6 +42,9 @@ type stateFile struct {
 	// Holds persists live capacity holds so a reopened directory cannot
 	// hand already-owned capacity to another session.
 	Holds []Hold `json:"holds,omitempty"`
+	// Sessions persists selection decisions and histories so retries after
+	// restart return the same confirmation instead of regenerating it.
+	Sessions []persistedSession `json:"sessions,omitempty"`
 }
 
 // Save atomically persists the live directory, including readiness state,
@@ -73,6 +76,9 @@ func (r *Registry) Save(dir string) error {
 	}
 	for _, h := range r.holds {
 		img.Holds = append(img.Holds, h)
+	}
+	for _, sess := range r.sessions {
+		img.Sessions = append(img.Sessions, sess)
 	}
 	r.mu.Unlock()
 
@@ -136,6 +142,9 @@ func OpenRegistry(dir string, opts ...Option) (*Registry, error) {
 			continue
 		}
 		r.holds[h.ID] = h
+	}
+	for _, sess := range img.Sessions {
+		r.sessions[sess.ID] = sess
 	}
 	var lapsed []onDiskEntry
 	for _, de := range img.Entries {

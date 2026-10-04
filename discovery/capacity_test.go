@@ -95,6 +95,59 @@ func TestCapacityReserveConfirmContention(t *testing.T) {
 	}
 }
 
+// A reservation that could only place one of two holds must not be reported
+// as a satisfied two-instance decision. The partial result is available only
+// after explicit degradation acceptance and cannot touch the other owner.
+func TestPartialReservationRequiresExplicitDegradation(t *testing.T) {
+	reg, _ := newFakeRegistry(64)
+	readyCapInst(t, reg, "a", "grpc", "1")
+
+	owner, _ := reg.NewSelectionSession(capCriteria(1))
+	ownerRes, err := owner.Reserve(time.Minute)
+	if err != nil || !ownerRes.Satisfied || ownerRes.Picks[0].ID != "a" {
+		t.Fatalf("owner reservation = %+v err=%v", ownerRes, err)
+	}
+	if _, err := owner.Confirm(); err != nil {
+		t.Fatal(err)
+	}
+	readyCapInst(t, reg, "b", "grpc", "1")
+
+	waiter, _ := reg.NewSelectionSession(capCriteria(2))
+	partial, err := waiter.Reserve(time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial.Satisfied || len(partial.Picks) != 1 || partial.Picks[0].ID != "b" {
+		t.Fatalf("partial reservation = %+v", partial)
+	}
+	if _, err := waiter.Confirm(); !errors.Is(err, ErrDegradationNeedsAccept) {
+		t.Fatalf("partial confirm err = %v", err)
+	}
+	if holds := waiter.Holds(); len(holds) != 1 || holds[0].Kind != HoldReserved {
+		t.Fatalf("rejected confirm changed reservation: %+v", holds)
+	}
+	if holds := owner.Holds(); len(holds) != 1 || holds[0].InstanceID != "a" || holds[0].Kind != HoldConfirmed {
+		t.Fatalf("owner capacity changed: %+v", holds)
+	}
+
+	decided, err := waiter.ConfirmAcceptingDegradation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decided.Satisfied || decided.Honored != 1 || len(decided.Picked) != 1 || decided.Picked[0].ID != "b" {
+		t.Fatalf("degraded decision = %+v", decided)
+	}
+	if len(decided.CandidatePicked) != 2 {
+		t.Fatalf("full candidate not recorded: %+v", decided.CandidatePicked)
+	}
+	if holds := waiter.Holds(); len(holds) != 1 || holds[0].InstanceID != "b" || holds[0].Kind != HoldConfirmed {
+		t.Fatalf("waiter holds = %+v", holds)
+	}
+	if holds := owner.Holds(); len(holds) != 1 || holds[0].InstanceID != "a" {
+		t.Fatalf("owner holds stolen: %+v", holds)
+	}
+}
+
 // Reservations lapse on their own; confirming after expiry only succeeds
 // when the capacity is still free, and cancel is idempotent.
 func TestReservationExpiryAndCancel(t *testing.T) {
@@ -279,9 +332,12 @@ func TestCapacitySurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	// s1's confirmed hold is still owned; s2's reserved hold is gone.
-	rc := reg2.mustRecheck(t, s1.ID(), capCriteria(1))
-	if len(rc.Guaranteed) != 1 {
-		t.Fatalf("guaranteed after reopen = %+v", rc.Guaranteed)
+	s1r, err := reg2.ResumeSelectionSession(s1.ID(), capCriteria(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if holds := s1r.Holds(); len(holds) != 1 || holds[0].Kind != HoldConfirmed {
+		t.Fatalf("confirmed ownership after reopen = %+v", holds)
 	}
 	s2r, err := reg2.ResumeSelectionSession(s2.ID(), capCriteria(1))
 	if err != nil {
@@ -291,19 +347,29 @@ func TestCapacitySurvivesReopen(t *testing.T) {
 	if err != nil || !res.Satisfied {
 		t.Fatalf("re-reserve after reopen = %+v err=%v", res, err)
 	}
-	// Duplicate confirm from s1 after recovery: same decision, one owner.
-	s1r, err := reg2.ResumeSelectionSession(s1.ID(), capCriteria(1))
+	// Duplicate confirmation after recovery: same decision, one owner.
+	s1rAgain, err := reg2.ResumeSelectionSession(s1.ID(), capCriteria(1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	s1r.Recheck()
-	if _, err := s1r.Confirm(); err != nil {
+	before := s1r.Current()
+	if hist := s1r.History(); len(hist) != 2 || hist[1].Seq != before.Seq {
+		t.Fatalf("restored history = %+v current=%+v", hist, before)
+	}
+	dup, err := s1rAgain.Confirm()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s1r.Confirm(); err != nil {
+	if dup.Seq != before.Seq || len(dup.Picked) != len(before.Picked) || dup.Picked[0].ID != before.Picked[0].ID {
+		t.Fatalf("duplicate decision = %+v want %+v", dup, before)
+	}
+	if _, err := s1rAgain.Confirm(); err != nil {
 		t.Fatalf("duplicate confirm after recovery = %v", err)
 	}
-	if holds := s1r.Holds(); len(holds) != 1 || holds[0].Kind != HoldConfirmed {
+	if hist := s1rAgain.History(); len(hist) != 2 {
+		t.Fatalf("duplicate confirmation rewrote history: %+v", hist)
+	}
+	if holds := s1rAgain.Holds(); len(holds) != 1 || holds[0].Kind != HoldConfirmed {
 		t.Fatalf("s1 holds after recovery = %+v", holds)
 	}
 }

@@ -34,9 +34,9 @@ reg.Deregister(h.Instance.Service, h.Instance.ID, h.Token)
 - 会话演进：`Recheck()`/`RecheckWith(新条件)` 针对当前目录给出候选选择，并把已确认记录中失效的实例列入 `Stale`（区分 `lease expired`、`deregistered`、能力缺失、未就绪），失效实例不会出现在候选可用集中；`Confirm()` 才切换到候选并追加进不可变历史，暂缓切换则保留原记录与短缺原因。目录重开后失效原因一致，因为离职审计随 `Save` 持久化。
 - 选择比较：`CompareSelections(a, b)` 说明两次选择的差异来自实例状态变化（`Lost`/`Gained` 及每个实例的原因）还是用户条件变化（`CriteriaChanges`）；历史记录只增不改，新条件不会补写进旧记录。
 - 容量预留：实例元数据键 `capacity` 声明可用容量（缺省为 1）。选择会话区分三种状态：仅供预览的候选（`Recheck` 的 `Candidate`，多个会话可能同时看到同一份容量）、暂时预留（`Reserve(ttl)` 产生的 `reserved` 占用，带截止时间）、已确认使用（`Confirm` 后的 `confirmed` 占用，无 expiry）。`Recheck` 的 `Honorable` 说明当前还能兑现多少实例，`Guaranteed`/`LostGuarantee` 说明已确认容量中仍然有保障与失去保障的范围及原因。容量占用（`Hold`）是所有权的唯一事实来源，同一份容量不会同时属于两个会话，也绝不会为补足某会话的最低数量而挪用另一会话已确认的容量。
-- 预留生命周期：`Reserve` 后可在有效期内 `Confirm` 转为确认使用，或 `CancelReservation` 提前释放，或任其到期自动失效（与租约一样在所有读写路径内联处理）。重复 `Confirm` 返回同一次决定、重复 `CancelReservation` 是空操作，不会多占或多释放。预留已失效才 `Confirm` 时，仅当容量仍然空闲才重新获取，否则返回 `ErrCapacityUnavailable`，候选保持待决。
+- 预留生命周期：`Reserve` 后可在有效期内 `Confirm` 转为确认使用，或 `CancelReservation` 提前释放，或任其到期自动失效（与租约一样在所有读写路径内联处理）。确认结果的 `Picked`/`Satisfied` 只表示本会话实际拥有的容量，部分预留不会把完整候选报告为已满足；完整候选保存在 `CandidatePicked`，实际兑现数量保存在 `Honored`。重复 `Confirm` 返回同一次决定、重复 `CancelReservation` 是空操作，不会多占或多释放。预留已失效才 `Confirm` 时，仅当容量仍然空闲才重新获取；没有任何可兑现容量时返回 `ErrCapacityUnavailable`，只够部分兑现时必须显式调用 `ConfirmAcceptingDegradation`。
 - 替换与降级：`Recheck`/`RecheckWith` 的 `Switch` 说明旧占用在 Confirm 提交时释放、新预留在 Confirm 时生效，以及 `Uninterrupted` 是否满足不中断条件；条件不足时 `Confirm` 返回 `ErrDegradationNeedsAccept`，需用户用 `ConfirmAcceptingDegradation` 明确接受降级，否则保持原选择与原占用。
-- 容量持久化与恢复：`Save`/`OpenRegistry` 一并落盘与恢复存活占用；停机期间过期的预留不会被复活。`ResumeSelectionSession(sessionID, ...)` 让客户端在目录恢复后以原身份继续，恢复后收到的重复确认/取消仍对应同一份容量，不会产生矛盾归属。不要求容量预留的只读选择会话行为不变。
+- 容量持久化与恢复：`Save`/`OpenRegistry` 一并落盘与恢复存活占用和会话的确认、取消、选择历史、待决候选与最近决定；停机期间过期的预留不会被复活。`ResumeSelectionSession(sessionID, ...)` 让客户端在目录恢复后以原身份继续，恢复后收到的重复确认仍返回同一次决定，不会重新生成或追加历史，也不会产生矛盾归属。不要求容量预留的只读选择会话行为不变。
 - 可控时钟：`FakeClock` 支持冻结时间和手动 `Advance`，定时器只随时钟推进触发，用于确定性地验证续租、重连、扫描与重启一致性。
 
 ## 测试

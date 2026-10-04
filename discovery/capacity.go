@@ -252,6 +252,9 @@ func (s *Session) Reserve(ttl time.Duration) (Reservation, error) {
 	s.mu.Lock()
 	s.reservationID = resID
 	s.capacityAware = true
+	s.reg.mu.Lock()
+	s.reg.sessions[s.id] = s.snapshotStateLocked()
+	s.reg.mu.Unlock()
 	s.mu.Unlock()
 	return res, nil
 }
@@ -260,6 +263,7 @@ func (s *Session) Reserve(ttl time.Duration) (Reservation, error) {
 // holds. It is idempotent: repeating it is a no-op and never releases
 // capacity twice or touches confirmed usage.
 func (s *Session) CancelReservation() {
+	s.mu.Lock()
 	s.reg.mu.Lock()
 	s.reg.expireStaleLocked(s.reg.clock.Now())
 	for id, h := range s.reg.holds {
@@ -267,9 +271,9 @@ func (s *Session) CancelReservation() {
 			delete(s.reg.holds, id)
 		}
 	}
-	s.reg.mu.Unlock()
-	s.mu.Lock()
 	s.reservationID = ""
+	s.reg.sessions[s.id] = s.snapshotStateLocked()
+	s.reg.mu.Unlock()
 	s.mu.Unlock()
 }
 
@@ -309,6 +313,15 @@ func (r *Registry) ResumeSelectionSession(sessionID string, c Criteria) (*Sessio
 		return nil, err
 	}
 	s := &Session{reg: r, id: sessionID}
+	r.mu.Lock()
+	state, ok := r.sessions[sessionID]
+	r.mu.Unlock()
+	if ok {
+		s.mu.Lock()
+		s.restoreStateLocked(state)
+		s.mu.Unlock()
+		return s, nil
+	}
 	first := r.evaluate(c, 1)
 	s.seq = 1
 	s.current = first
@@ -321,5 +334,6 @@ func (r *Registry) ResumeSelectionSession(sessionID string, c Criteria) (*Sessio
 		}
 	}
 	r.mu.Unlock()
+	s.persistState()
 	return s, nil
 }

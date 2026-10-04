@@ -175,7 +175,8 @@ type Registry struct {
 	// holds tracks capacity ownership per session, keyed by hold ID. It is
 	// the single source of truth for which session owns which capacity
 	// unit, so concurrent sessions can never own the same unit.
-	holds map[string]Hold
+	holds    map[string]Hold
+	sessions map[string]persistedSession
 }
 
 // RemovalRecord captures a departure, distinguishing lease failure from an
@@ -195,6 +196,7 @@ func NewRegistry(opts ...Option) *Registry {
 		instances: make(map[string]*entry),
 		removals:  make(map[string]RemovalRecord),
 		holds:     make(map[string]Hold),
+		sessions:  make(map[string]persistedSession),
 	}
 	for _, opt := range opts {
 		opt(r)
