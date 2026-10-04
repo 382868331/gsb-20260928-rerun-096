@@ -176,6 +176,10 @@ type Registry struct {
 	// the single source of truth for which session owns which capacity
 	// unit, so concurrent sessions can never own the same unit.
 	holds map[string]Hold
+	// sessions stores durable selection-session state. Save serializes the
+	// sessions together with holds so retries after reopen can return the
+	// same decision instead of reconstructing a different history.
+	sessions map[string]*Session
 }
 
 // RemovalRecord captures a departure, distinguishing lease failure from an
@@ -195,6 +199,7 @@ func NewRegistry(opts ...Option) *Registry {
 		instances: make(map[string]*entry),
 		removals:  make(map[string]RemovalRecord),
 		holds:     make(map[string]Hold),
+		sessions:  make(map[string]*Session),
 	}
 	for _, opt := range opts {
 		opt(r)

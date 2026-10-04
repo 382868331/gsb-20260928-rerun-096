@@ -184,6 +184,65 @@ func TestConfirmedCapacityNotStolen(t *testing.T) {
 	_ = hA
 }
 
+// A reservation that could obtain only part of the demand must never be
+// reported as a fully satisfied decision. Confirm keeps the reserved units
+// pending until the caller explicitly accepts the smaller honored range.
+func TestPartialReservationRequiresExplicitDegradation(t *testing.T) {
+	reg, _ := newFakeRegistry(64)
+	readyCapInst(t, reg, "a", "grpc", "1")
+
+	owner, _ := reg.NewSelectionSession(capCriteria(1))
+	if _, err := owner.Reserve(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.Confirm(); err != nil {
+		t.Fatal(err)
+	}
+	readyCapInst(t, reg, "b", "grpc", "1")
+
+	loser, _ := reg.NewSelectionSession(capCriteria(2))
+	res, err := loser.Reserve(time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Satisfied || len(res.Picks) != 1 || res.Picks[0].ID != "b" {
+		t.Fatalf("partial reservation = %+v", res)
+	}
+	if _, err := loser.Confirm(); !errors.Is(err, ErrDegradationNeedsAccept) {
+		t.Fatalf("confirm partial reservation err = %v", err)
+	}
+	if holds := loser.Holds(); len(holds) != 1 || holds[0].Kind != HoldReserved {
+		t.Fatalf("rejected confirmation changed holds = %+v", holds)
+	}
+	if holds := owner.Holds(); len(holds) != 1 || holds[0].Kind != HoldConfirmed {
+		t.Fatalf("owner holds changed = %+v", holds)
+	}
+
+	decided, err := loser.ConfirmAcceptingDegradation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decided.Satisfied || len(decided.Picked) != 1 || decided.Picked[0].ID != "b" {
+		t.Fatalf("degraded decision = %+v", decided)
+	}
+	if !strings.Contains(decided.Shortfall, "1 had reservable capacity") {
+		t.Fatalf("decision shortfall = %q", decided.Shortfall)
+	}
+	if current := loser.Current(); current.Seq != decided.Seq || len(current.Picked) != 1 {
+		t.Fatalf("current decision = %+v", current)
+	}
+	history := loser.History()
+	if len(history) != 2 || len(history[1].Picked) != 1 {
+		t.Fatalf("history = %+v", history)
+	}
+	if holds := loser.Holds(); len(holds) != 1 || holds[0].Kind != HoldConfirmed || holds[0].InstanceID != "b" {
+		t.Fatalf("loser holds = %+v", holds)
+	}
+	if holds := owner.Holds(); len(holds) != 1 || holds[0].InstanceID != "a" {
+		t.Fatalf("owner capacity was stolen = %+v", holds)
+	}
+}
+
 // A replacement proposal explains the release/effective timing and blocks
 // a degrading switch until the user explicitly accepts it.
 func TestSwitchPlanAndDegradationGate(t *testing.T) {
@@ -279,9 +338,12 @@ func TestCapacitySurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	// s1's confirmed hold is still owned; s2's reserved hold is gone.
-	rc := reg2.mustRecheck(t, s1.ID(), capCriteria(1))
-	if len(rc.Guaranteed) != 1 {
-		t.Fatalf("guaranteed after reopen = %+v", rc.Guaranteed)
+	reg2.mu.Lock()
+	s1Holds := reg2.sessionHoldsLocked(s1.ID(), HoldConfirmed)
+	s2Holds := reg2.sessionHoldsLocked(s2.ID(), HoldReserved)
+	reg2.mu.Unlock()
+	if len(s1Holds) != 1 || len(s2Holds) != 0 {
+		t.Fatalf("holds after reopen: s1=%+v s2=%+v", s1Holds, s2Holds)
 	}
 	s2r, err := reg2.ResumeSelectionSession(s2.ID(), capCriteria(1))
 	if err != nil {
@@ -296,7 +358,6 @@ func TestCapacitySurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s1r.Recheck()
 	if _, err := s1r.Confirm(); err != nil {
 		t.Fatal(err)
 	}
@@ -305,6 +366,180 @@ func TestCapacitySurvivesReopen(t *testing.T) {
 	}
 	if holds := s1r.Holds(); len(holds) != 1 || holds[0].Kind != HoldConfirmed {
 		t.Fatalf("s1 holds after recovery = %+v", holds)
+	}
+}
+
+// Session decisions and history are persisted, not just holds. A repeated
+// confirmation after reopen returns the original committed record and does
+// not append a freshly evaluated candidate; a repeated cancellation likewise
+// keeps operating on the same pre-restart reservation.
+func TestSessionDecisionAndCancelSurviveReopen(t *testing.T) {
+	reg, clk := newFakeRegistry(64)
+	readyCapInst(t, reg, "a", "grpc", "1")
+
+	confirmed, _ := reg.NewSelectionSession(capCriteria(1))
+	if _, err := confirmed.Reserve(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	original, err := confirmed.Confirm()
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyCapInst(t, reg, "b", "grpc", "1")
+
+	canceller, _ := reg.NewSelectionSession(capCriteria(1))
+	cancelRes, err := canceller.Reserve(5 * time.Second)
+	if err != nil || !cancelRes.Satisfied || cancelRes.Picks[0].ID != "b" {
+		t.Fatalf("canceller reservation = %+v err=%v", cancelRes, err)
+	}
+
+	dir := t.TempDir()
+	if err := reg.Save(dir); err != nil {
+		t.Fatal(err)
+	}
+	clk.Advance(10 * time.Second)
+	re, err := OpenRegistry(dir, WithClock(clk))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	confirmed2, err := re.ResumeSelectionSession(confirmed.ID(), capCriteria(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := confirmed2.Confirm()
+	if err != nil {
+		t.Fatalf("duplicate confirm after reopen = %v", err)
+	}
+	again, err := confirmed2.Confirm()
+	if err != nil {
+		t.Fatalf("second duplicate confirm after reopen = %v", err)
+	}
+	if duplicate.Seq != original.Seq || again.Seq != original.Seq ||
+		len(duplicate.Picked) != 1 || duplicate.Picked[0].ID != original.Picked[0].ID {
+		t.Fatalf("duplicate decisions = %+v, %+v; original %+v", duplicate, again, original)
+	}
+	if history := confirmed2.History(); len(history) != 2 || history[1].Seq != original.Seq {
+		t.Fatalf("history after reopen = %+v", history)
+	}
+	if current := confirmed2.Current(); current.Seq != original.Seq {
+		t.Fatalf("current after reopen = %+v", current)
+	}
+
+	canceller2, err := re.ResumeSelectionSession(canceller.ID(), capCriteria(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceller2.CancelReservation()
+	canceller2.CancelReservation()
+	if history := canceller2.History(); len(history) != 1 {
+		t.Fatalf("cancel rewrote history = %+v", history)
+	}
+	if holds := canceller2.Holds(); len(holds) != 0 {
+		t.Fatalf("expired reservation holds = %+v", holds)
+	}
+
+	late, _ := re.NewSelectionSession(capCriteria(1))
+	lateRes, err := late.Reserve(time.Minute)
+	if err != nil || !lateRes.Satisfied || lateRes.Picks[0].ID != "b" {
+		t.Fatalf("freed capacity not available = %+v err=%v", lateRes, err)
+	}
+}
+
+// Reservation expiry, capacity contention and a directory restart can all
+// interleave. The loser can neither turn free-looking preview capacity into
+// a guarantee nor steal the winner's confirmed unit; durable session records
+// keep reporting exactly the range the holds can honor.
+func TestCapacityContentionExpiryReopenInterleaving(t *testing.T) {
+	reg, clk := newFakeRegistry(64)
+	readyCapInst(t, reg, "a", "grpc", "1")
+	readyCapInst(t, reg, "b", "grpc", "1")
+
+	loser, _ := reg.NewSelectionSession(capCriteria(2))
+	lostRes, err := loser.Reserve(5 * time.Second)
+	if err != nil || !lostRes.Satisfied || len(lostRes.Picks) != 2 {
+		t.Fatalf("initial reservation = %+v err=%v", lostRes, err)
+	}
+
+	// Before the loser confirms, an independent session confirms one unit.
+	winner, _ := reg.NewSelectionSession(capCriteria(1))
+	winnerRes, err := winner.Reserve(time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if winnerRes.Satisfied || len(winnerRes.Picks) != 0 {
+		t.Fatalf("winner should not reserve a held unit: %+v", winnerRes)
+	}
+	clk.Advance(6 * time.Second)
+	winnerRes, err = winner.Reserve(time.Minute)
+	if err != nil || !winnerRes.Satisfied || len(winnerRes.Picks) != 2 {
+		t.Fatalf("winner after loser expiry = %+v err=%v", winnerRes, err)
+	}
+	won, err := winner.Confirm()
+	if err != nil || len(won.Picked) != 2 {
+		t.Fatalf("winner confirm = %+v err=%v", won, err)
+	}
+
+	dir := t.TempDir()
+	if err := reg.Save(dir); err != nil {
+		t.Fatal(err)
+	}
+	re, err := OpenRegistry(dir, WithClock(clk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loser2, err := re.ResumeSelectionSession(loser.ID(), capCriteria(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loser2.Confirm(); !errors.Is(err, ErrCapacityUnavailable) {
+		t.Fatalf("expired reservation after reopen err = %v", err)
+	}
+	winner2, err := re.ResumeSelectionSession(winner.ID(), capCriteria(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wonAgain, err := winner2.Confirm()
+	if err != nil || wonAgain.Seq != won.Seq || len(wonAgain.Picked) != 2 {
+		t.Fatalf("duplicate winner confirm = %+v err=%v", wonAgain, err)
+	}
+	if holds := loser2.Holds(); len(holds) != 0 {
+		t.Fatalf("loser retained expired holds = %+v", holds)
+	}
+	w, err := re.ResumeSelectionSession(winner.ID(), capCriteria(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if holds := w.Holds(); len(holds) != 2 || holds[0].Kind != HoldConfirmed {
+		t.Fatalf("winner ledger = %+v", holds)
+	}
+
+	w.ReleaseConfirmed()
+	w.CancelReservation()
+	res, err := loser2.Reserve(2 * time.Minute)
+	if err != nil || !res.Satisfied || len(res.Picks) != 2 {
+		t.Fatalf("loser re-reserve = %+v err=%v", res, err)
+	}
+	decided, err := loser2.Confirm()
+	if err != nil || len(decided.Picked) != 2 {
+		t.Fatalf("loser final confirm = %+v err=%v", decided, err)
+	}
+	if _, err := loser2.Confirm(); err != nil || loser2.Current().Seq != decided.Seq {
+		t.Fatalf("loser duplicate confirm = %v", err)
+	}
+	if len(loser2.History()) != 2 {
+		t.Fatalf("loser history = %+v", loser2.History())
+	}
+	re.mu.Lock()
+	owners := map[string]int{}
+	kinds := map[HoldKind]int{}
+	for _, h := range re.holds {
+		owners[h.SessionID]++
+		kinds[h.Kind]++
+	}
+	re.mu.Unlock()
+	if len(owners) != 1 || owners[loser.ID()] != 2 || kinds[HoldConfirmed] != 2 || kinds[HoldReserved] != 0 {
+		t.Fatalf("final hold ledger owners=%v kinds=%v", owners, kinds)
 	}
 }
 

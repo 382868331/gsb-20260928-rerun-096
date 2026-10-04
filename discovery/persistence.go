@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -41,7 +42,24 @@ type stateFile struct {
 	Removals        []RemovalRecord `json:"removals"`
 	// Holds persists live capacity holds so a reopened directory cannot
 	// hand already-owned capacity to another session.
-	Holds []Hold `json:"holds,omitempty"`
+	Holds    []Hold          `json:"holds,omitempty"`
+	Sessions []onDiskSession `json:"sessions,omitempty"`
+}
+
+// onDiskSession is the durable decision state for one selection session.
+// Holds alone identify ownership but cannot reconstruct the immutable
+// decision/history needed to make post-restart retries idempotent.
+type onDiskSession struct {
+	ID            string      `json:"id"`
+	Seq           int64       `json:"seq"`
+	Current       Selection   `json:"current"`
+	History       []Selection `json:"history"`
+	Pending       *Selection  `json:"pending,omitempty"`
+	HasPending    bool        `json:"has_pending"`
+	CapacityAware bool        `json:"capacity_aware"`
+	ReservationID string      `json:"reservation_id,omitempty"`
+	LastConfirm   Selection   `json:"last_confirm"`
+	HasLast       bool        `json:"has_last_confirm"`
 }
 
 // Save atomically persists the live directory, including readiness state,
@@ -49,32 +67,87 @@ type stateFile struct {
 // already gone from the directory, so a saved image can never bring a lapsed
 // instance back on reopen.
 func (r *Registry) Save(dir string) error {
-	r.mu.Lock()
-	// Persist only leases that are still effective at save time; lapsed
-	// leases are expired inline (with events and audit) instead of being
-	// written as live entries.
-	r.expireStaleLocked(r.clock.Now())
-	img := stateFile{
-		Version:         r.version,
-		CompactedBefore: r.compactedBefore,
-		Log:             append([]Change(nil), r.log...),
-		Removals:        make([]RemovalRecord, 0, len(r.removals)),
+	var img stateFile
+	for {
+		r.mu.Lock()
+		sessionRefs := make([]*Session, 0, len(r.sessions))
+		for _, sess := range r.sessions {
+			sessionRefs = append(sessionRefs, sess)
+		}
+		r.mu.Unlock()
+		sort.Slice(sessionRefs, func(i, j int) bool { return sessionRefs[i].id < sessionRefs[j].id })
+		for _, sess := range sessionRefs {
+			sess.mu.Lock()
+		}
+
+		r.mu.Lock()
+		stable := len(r.sessions) == len(sessionRefs)
+		if stable {
+			for _, sess := range sessionRefs {
+				if r.sessions[sess.id] != sess {
+					stable = false
+					break
+				}
+			}
+		}
+		if !stable {
+			r.mu.Unlock()
+			for i := len(sessionRefs) - 1; i >= 0; i-- {
+				sessionRefs[i].mu.Unlock()
+			}
+			continue
+		}
+
+		// Persist only leases that are still effective at save time; lapsed
+		// leases are expired inline (with events and audit) instead of being
+		// written as live entries.
+		r.expireStaleLocked(r.clock.Now())
+		img = stateFile{
+			Version:         r.version,
+			CompactedBefore: r.compactedBefore,
+			Log:             append([]Change(nil), r.log...),
+			Removals:        make([]RemovalRecord, 0, len(r.removals)),
+		}
+		for _, e := range r.instances {
+			img.Entries = append(img.Entries, onDiskEntry{
+				Instance: cloneInst(e.inst),
+				Token:    e.token,
+				Deadline: e.deadline,
+				Lease:    duration(e.lease),
+			})
+		}
+		for _, rec := range r.removals {
+			img.Removals = append(img.Removals, rec)
+		}
+		for _, h := range r.holds {
+			img.Holds = append(img.Holds, h)
+		}
+		for _, sess := range sessionRefs {
+			onDisk := onDiskSession{
+				ID:            sess.id,
+				Seq:           sess.seq,
+				Current:       cloneSelection(sess.current),
+				CapacityAware: sess.capacityAware,
+				ReservationID: sess.reservationID,
+				LastConfirm:   cloneSelection(sess.lastConfirm),
+				HasLast:       sess.hasLastConfirm,
+				HasPending:    sess.hasPending,
+			}
+			for _, rec := range sess.history {
+				onDisk.History = append(onDisk.History, cloneSelection(rec))
+			}
+			if sess.pending != nil {
+				pending := cloneSelection(*sess.pending)
+				onDisk.Pending = &pending
+			}
+			img.Sessions = append(img.Sessions, onDisk)
+		}
+		r.mu.Unlock()
+		for i := len(sessionRefs) - 1; i >= 0; i-- {
+			sessionRefs[i].mu.Unlock()
+		}
+		break
 	}
-	for _, e := range r.instances {
-		img.Entries = append(img.Entries, onDiskEntry{
-			Instance: cloneInst(e.inst),
-			Token:    e.token,
-			Deadline: e.deadline,
-			Lease:    duration(e.lease),
-		})
-	}
-	for _, rec := range r.removals {
-		img.Removals = append(img.Removals, rec)
-	}
-	for _, h := range r.holds {
-		img.Holds = append(img.Holds, h)
-	}
-	r.mu.Unlock()
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("discovery: create state dir: %w", err)
@@ -136,6 +209,27 @@ func OpenRegistry(dir string, opts ...Option) (*Registry, error) {
 			continue
 		}
 		r.holds[h.ID] = h
+	}
+	for _, onDisk := range img.Sessions {
+		sess := &Session{
+			reg:            r,
+			id:             onDisk.ID,
+			seq:            onDisk.Seq,
+			current:        cloneSelection(onDisk.Current),
+			capacityAware:  onDisk.CapacityAware,
+			reservationID:  onDisk.ReservationID,
+			lastConfirm:    cloneSelection(onDisk.LastConfirm),
+			hasLastConfirm: onDisk.HasLast,
+			hasPending:     onDisk.HasPending && onDisk.Pending != nil,
+		}
+		for _, rec := range onDisk.History {
+			sess.history = append(sess.history, cloneSelection(rec))
+		}
+		if onDisk.Pending != nil {
+			pending := cloneSelection(*onDisk.Pending)
+			sess.pending = &pending
+		}
+		r.sessions[sess.id] = sess
 	}
 	var lapsed []onDiskEntry
 	for _, de := range img.Entries {

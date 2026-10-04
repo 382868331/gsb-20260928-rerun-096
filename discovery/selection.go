@@ -126,6 +126,25 @@ type Selection struct {
 	Shortfall string
 }
 
+func cloneSelection(in Selection) Selection {
+	out := in
+	out.Criteria.Capabilities = append([]string(nil), in.Criteria.Capabilities...)
+	out.Basis.Instances = append([]Instance(nil), in.Basis.Instances...)
+	for i := range out.Basis.Instances {
+		out.Basis.Instances[i] = cloneInst(out.Basis.Instances[i])
+	}
+	out.Verdicts = append([]Verdict(nil), in.Verdicts...)
+	for i := range out.Verdicts {
+		out.Verdicts[i].Instance = cloneInst(in.Verdicts[i].Instance)
+		out.Verdicts[i].Reasons = append([]string(nil), in.Verdicts[i].Reasons...)
+	}
+	out.Picked = append([]Instance(nil), in.Picked...)
+	for i := range out.Picked {
+		out.Picked[i] = cloneInst(in.Picked[i])
+	}
+	return out
+}
+
 // StaleEntry explains why an instance from the confirmed selection is no
 // longer usable right now.
 type StaleEntry struct {
@@ -260,6 +279,9 @@ func (r *Registry) NewSelectionSession(c Criteria) (*Session, error) {
 	s.seq = 1
 	s.current = first
 	s.history = append(s.history, first)
+	r.mu.Lock()
+	r.sessions[s.id] = s
+	r.mu.Unlock()
 	return s, nil
 }
 
@@ -458,39 +480,38 @@ func (s *Session) confirm(acceptDegradation bool) (Selection, error) {
 	cand := *s.pending
 	aware := s.capacityAware
 	resID := s.reservationID
-	currentlySatisfied := s.current.Satisfied
 	s.mu.Unlock()
 
 	if aware {
-		if currentlySatisfied && !cand.Satisfied && !acceptDegradation {
-			return Selection{}, fmt.Errorf("%w: %s", ErrDegradationNeedsAccept, cand.Shortfall)
-		}
 		now := s.reg.clock.Now()
 		s.reg.mu.Lock()
 		s.reg.expireStaleLocked(now)
-		converted := false
+		reservedIDs := map[string]bool{}
 		if resID != "" {
 			for id, h := range s.reg.holds {
 				if h.SessionID == s.id && h.Kind == HoldReserved &&
-					strings.HasPrefix(id, resID+":") {
-					h.Kind = HoldConfirmed
-					h.ExpiresAt = time.Time{}
-					s.reg.holds[id] = h
-					converted = true
+					id == resID+":"+h.InstanceID {
+					reservedIDs[h.InstanceID] = true
 				}
 			}
 		}
-		if !converted {
+
+		targetIDs := map[string]bool{}
+		for _, inst := range cand.Picked {
+			if _, live := s.reg.instances[key(inst.Service, inst.ID)]; !live {
+				continue
+			}
+			if reservedIDs[inst.ID] || s.reg.hasConfirmedHoldLocked(s.id, inst.Service, inst.ID) {
+				targetIDs[inst.ID] = true
+			}
+		}
+
+		var created []string
+		if len(reservedIDs) == 0 {
 			// No live reservation (expired, cancelled, or never made):
 			// acquire confirmed units only from still-free capacity.
-			var created []string
-			acquired := 0
 			for _, inst := range cand.Picked {
 				if _, live := s.reg.instances[key(inst.Service, inst.ID)]; !live {
-					continue
-				}
-				if s.reg.hasConfirmedHoldLocked(s.id, inst.Service, inst.ID) {
-					acquired++
 					continue
 				}
 				if s.reg.freeCapacityLocked(inst, s.id) <= 0 {
@@ -506,26 +527,54 @@ func (s *Session) confirm(acceptDegradation bool) (Selection, error) {
 					CreatedAt:  now,
 				}
 				created = append(created, hid)
-				acquired++
+				targetIDs[inst.ID] = true
 			}
-			if acquired < cand.Criteria.MinAvailable && !acceptDegradation {
-				for _, hid := range created {
-					delete(s.reg.holds, hid)
-				}
-				s.reg.mu.Unlock()
+		}
+
+		if len(targetIDs) < cand.Criteria.MinAvailable && !acceptDegradation {
+			for _, hid := range created {
+				delete(s.reg.holds, hid)
+			}
+			s.reg.mu.Unlock()
+			if len(targetIDs) > 0 {
 				return Selection{}, fmt.Errorf(
-					"%w: reservation is gone and only %d of %d required instance(s) still have free capacity",
-					ErrCapacityUnavailable, acquired, cand.Criteria.MinAvailable)
+					"%w: only %d of %d required instance(s) were reserved; actual reservable range recorded in the pending decision",
+					ErrDegradationNeedsAccept, len(targetIDs), cand.Criteria.MinAvailable)
 			}
+			return Selection{}, fmt.Errorf(
+				"%w: reservation is gone and only %d of %d required instance(s) still have free capacity",
+				ErrCapacityUnavailable, len(targetIDs), cand.Criteria.MinAvailable)
+		}
+
+		if len(reservedIDs) > 0 {
+			for id, h := range s.reg.holds {
+				if h.SessionID == s.id && h.Kind == HoldReserved &&
+					id == resID+":"+h.InstanceID && reservedIDs[h.InstanceID] {
+					h.Kind = HoldConfirmed
+					h.ExpiresAt = time.Time{}
+					s.reg.holds[id] = h
+				}
+			}
+		}
+		honoredPicks := make([]Instance, 0, len(targetIDs))
+		for _, inst := range cand.Picked {
+			if targetIDs[inst.ID] {
+				honoredPicks = append(honoredPicks, inst)
+			}
+		}
+		cand.Picked = honoredPicks
+		cand.Satisfied = len(cand.Picked) >= cand.Criteria.MinAvailable
+		if cand.Satisfied {
+			cand.Shortfall = ""
+		} else {
+			cand.Shortfall = fmt.Sprintf(
+				"need at least %d usable instance(s) for %q but only %d had reservable capacity",
+				cand.Criteria.MinAvailable, cand.Criteria.Service, len(cand.Picked))
 		}
 		// The switch releases old confirmed occupancy outside the new set.
-		picked := map[string]bool{}
-		for _, inst := range cand.Picked {
-			picked[inst.ID] = true
-		}
 		for id, h := range s.reg.holds {
 			if h.SessionID == s.id && h.Kind == HoldConfirmed &&
-				(h.Service != cand.Criteria.Service || !picked[h.InstanceID]) {
+				(h.Service != cand.Criteria.Service || !targetIDs[h.InstanceID]) {
 				delete(s.reg.holds, id)
 			}
 		}

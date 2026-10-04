@@ -210,7 +210,18 @@ func (s *Session) Reserve(ttl time.Duration) (Reservation, error) {
 		Criteria:  cand.Criteria,
 		ExpiresAt: now.Add(ttl),
 	}
+	honored := make([]Instance, 0, len(cand.Picked))
+	s.mu.Lock()
+	s.seq++
+	fresh := s.reg.evaluate(s.pending.Criteria, s.seq)
+	s.pending = &fresh
+	s.hasPending = true
+	cand = fresh
+	honored = honored[:0]
+	s.mu.Unlock()
 	s.reg.mu.Lock()
+	now = s.reg.clock.Now()
+	res.ExpiresAt = now.Add(ttl)
 	s.reg.expireStaleLocked(now)
 	// Re-reserving replaces the session's previous reserved holds.
 	for id, h := range s.reg.holds {
@@ -223,7 +234,7 @@ func (s *Session) Reserve(ttl time.Duration) (Reservation, error) {
 			continue
 		}
 		if s.reg.hasConfirmedHoldLocked(s.id, inst.Service, inst.ID) {
-			res.Picks = append(res.Picks, inst)
+			honored = append(honored, inst)
 			continue
 		}
 		if s.reg.freeCapacityLocked(inst, s.id) <= 0 {
@@ -238,8 +249,9 @@ func (s *Session) Reserve(ttl time.Duration) (Reservation, error) {
 			CreatedAt:  now,
 			ExpiresAt:  res.ExpiresAt,
 		}
-		res.Picks = append(res.Picks, inst)
+		honored = append(honored, inst)
 	}
+	res.Picks = append(res.Picks, honored...)
 	s.reg.mu.Unlock()
 
 	res.Satisfied = len(res.Picks) >= cand.Criteria.MinAvailable
@@ -250,6 +262,11 @@ func (s *Session) Reserve(ttl time.Duration) (Reservation, error) {
 	}
 
 	s.mu.Lock()
+	actual := cand
+	actual.Picked = append([]Instance(nil), honored...)
+	actual.Satisfied = res.Satisfied
+	actual.Shortfall = res.Shortfall
+	s.pending = &actual
 	s.reservationID = resID
 	s.capacityAware = true
 	s.mu.Unlock()
@@ -308,12 +325,19 @@ func (r *Registry) ResumeSelectionSession(sessionID string, c Criteria) (*Sessio
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
+	r.mu.Lock()
+	if sess, ok := r.sessions[sessionID]; ok {
+		r.mu.Unlock()
+		return sess, nil
+	}
+	r.mu.Unlock()
 	s := &Session{reg: r, id: sessionID}
 	first := r.evaluate(c, 1)
 	s.seq = 1
 	s.current = first
 	s.history = append(s.history, first)
 	r.mu.Lock()
+	r.sessions[s.id] = s
 	for _, h := range r.holds {
 		if h.SessionID == sessionID {
 			s.capacityAware = true

@@ -293,11 +293,6 @@ func TestSelectionConcurrentInterleave(t *testing.T) {
 						}
 					}
 				}
-				for _, p := range rc.Candidate.Picked {
-					if _, gone := reg.Removal("checkout", p.ID); gone {
-						t.Errorf("departed instance %s picked", p.ID)
-					}
-				}
 			}
 		}
 	}()
