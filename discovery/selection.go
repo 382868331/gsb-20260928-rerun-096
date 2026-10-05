@@ -257,19 +257,31 @@ type Session struct {
 	// instead of failing, so retries never double-allocate capacity.
 	lastConfirm    Selection
 	hasLastConfirm bool
+	// pendingTopUp is the live top-up reservation group, if any.
+	pendingTopUp *TopUp
+	// lastTopUp makes a duplicate ConfirmTopUp return the same decision.
+	lastTopUp    TopUp
+	hasLastTopUp bool
+	// decisions is the session's immutable capacity decision log, linking
+	// candidates, rejections, accepted degradations and top-ups.
+	decisions []CapacityDecision
 }
 
 type persistedSession struct {
-	ID             string      `json:"id"`
-	Seq            int64       `json:"seq"`
-	Current        Selection   `json:"current"`
-	History        []Selection `json:"history"`
-	Pending        *Selection  `json:"pending,omitempty"`
-	HasPending     bool        `json:"has_pending"`
-	CapacityAware  bool        `json:"capacity_aware"`
-	ReservationID  string      `json:"reservation_id,omitempty"`
-	LastConfirm    Selection   `json:"last_confirm"`
-	HasLastConfirm bool        `json:"has_last_confirm"`
+	ID             string             `json:"id"`
+	Seq            int64              `json:"seq"`
+	Current        Selection          `json:"current"`
+	History        []Selection        `json:"history"`
+	Pending        *Selection         `json:"pending,omitempty"`
+	HasPending     bool               `json:"has_pending"`
+	CapacityAware  bool               `json:"capacity_aware"`
+	ReservationID  string             `json:"reservation_id,omitempty"`
+	LastConfirm    Selection          `json:"last_confirm"`
+	HasLastConfirm bool               `json:"has_last_confirm"`
+	PendingTopUp   *TopUp             `json:"pending_top_up,omitempty"`
+	LastTopUp      TopUp              `json:"last_top_up"`
+	HasLastTopUp   bool               `json:"has_last_top_up"`
+	Decisions      []CapacityDecision `json:"decisions,omitempty"`
 }
 
 func (s *Session) snapshotStateLocked() persistedSession {
@@ -284,6 +296,10 @@ func (s *Session) snapshotStateLocked() persistedSession {
 		ReservationID:  s.reservationID,
 		LastConfirm:    cloneSelection(s.lastConfirm),
 		HasLastConfirm: s.hasLastConfirm,
+		PendingTopUp:   cloneTopUpPtr(s.pendingTopUp),
+		LastTopUp:      cloneTopUp(s.lastTopUp),
+		HasLastTopUp:   s.hasLastTopUp,
+		Decisions:      append([]CapacityDecision(nil), s.decisions...),
 	}
 }
 
@@ -307,6 +323,10 @@ func (s *Session) restoreStateLocked(state persistedSession) {
 	s.reservationID = state.ReservationID
 	s.lastConfirm = cloneSelection(state.LastConfirm)
 	s.hasLastConfirm = state.HasLastConfirm
+	s.pendingTopUp = cloneTopUpPtr(state.PendingTopUp)
+	s.lastTopUp = cloneTopUp(state.LastTopUp)
+	s.hasLastTopUp = state.HasLastTopUp
+	s.decisions = append([]CapacityDecision(nil), state.Decisions...)
 }
 
 func cloneSelectionPtr(in *Selection) *Selection {
@@ -315,6 +335,43 @@ func cloneSelectionPtr(in *Selection) *Selection {
 	}
 	out := cloneSelection(*in)
 	return &out
+}
+
+// missingCount clamps min-available minus honored at zero.
+func missingCount(c Criteria, honored int) int {
+	if m := c.MinAvailable - honored; m > 0 {
+		return m
+	}
+	return 0
+}
+
+// recordDecisionLocked appends one entry to the session's capacity
+// decision log. Read-only sessions keep no log. Callers must hold s.mu.
+func (s *Session) recordDecisionLocked(kind DecisionKind, candSeq int64, promised, honored, missing int, reason string) {
+	if !s.capacityAware {
+		return
+	}
+	s.decisions = append(s.decisions, CapacityDecision{
+		Seq:          int64(len(s.decisions)) + 1,
+		CandidateSeq: candSeq,
+		Kind:         kind,
+		At:           s.reg.clock.Now(),
+		Promised:     promised,
+		Honored:      honored,
+		Missing:      missing,
+		Reason:       reason,
+	})
+}
+
+// Decisions returns the session's capacity decision log in order, oldest
+// first. Each candidate, rejection, accepted degradation and top-up is one
+// immutable entry; entries sharing a CandidateSeq describe the same
+// selection candidate, so an operator can trace which candidate was
+// rejected and which degradation scope was explicitly accepted.
+func (s *Session) Decisions() []CapacityDecision {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]CapacityDecision(nil), s.decisions...)
 }
 
 func cloneSelections(in []Selection) []Selection {
@@ -417,7 +474,6 @@ func (s *Session) recheck(c Criteria) Recheck {
 	cand := s.reg.evaluateLocked(c, seq)
 	s.pending = &cand
 	s.hasPending = true
-	s.reg.sessions[s.id] = s.snapshotStateLocked()
 
 	rc := Recheck{
 		Candidate:       cand,
@@ -442,6 +498,11 @@ func (s *Session) recheck(c Criteria) Recheck {
 		})
 	}
 	s.fillCapacityViewLocked(&rc, base, c, usable, aware)
+	if aware {
+		s.recordDecisionLocked(DecisionCandidate, cand.Seq,
+			len(cand.Picked), rc.Honorable, missingCount(c, rc.Honorable), "")
+	}
+	s.reg.sessions[s.id] = s.snapshotStateLocked()
 	s.reg.mu.Unlock()
 	s.mu.Unlock()
 	return rc
@@ -605,24 +666,26 @@ func (s *Session) confirm(acceptDegradation bool) (Selection, error) {
 		}
 		honored := len(plan)
 		if honored < cand.Criteria.MinAvailable {
-			if resID != "" && !liveReservation {
-				s.reg.mu.Unlock()
-				if honored == 0 {
-					return Selection{}, fmt.Errorf(
-						"%w: reservation is gone and only %d of %d required instance(s) still have free capacity",
-						ErrCapacityUnavailable, honored, cand.Criteria.MinAvailable)
-				}
-			} else if honored == 0 {
-				s.reg.mu.Unlock()
-				return Selection{}, fmt.Errorf(
+			var reject error
+			switch {
+			case resID != "" && !liveReservation && honored == 0:
+				reject = fmt.Errorf(
+					"%w: reservation is gone and only %d of %d required instance(s) still have free capacity",
+					ErrCapacityUnavailable, honored, cand.Criteria.MinAvailable)
+			case (resID == "" || liveReservation) && honored == 0:
+				reject = fmt.Errorf(
 					"%w: only %d of %d required instance(s) have free capacity",
 					ErrCapacityUnavailable, honored, cand.Criteria.MinAvailable)
-			}
-			if !acceptDegradation {
-				s.reg.mu.Unlock()
-				return Selection{}, fmt.Errorf(
+			case !acceptDegradation:
+				reject = fmt.Errorf(
 					"%w: only %d of %d required instance(s) can be guaranteed; explicit acceptance required",
 					ErrDegradationNeedsAccept, honored, cand.Criteria.MinAvailable)
+			}
+			if reject != nil {
+				s.reg.mu.Unlock()
+				s.noteDecision(DecisionRejected, cand.Seq,
+					len(cand.Picked), honored, missingCount(cand.Criteria, honored), reject.Error())
+				return Selection{}, reject
 			}
 		}
 
@@ -688,11 +751,34 @@ func (s *Session) confirm(acceptDegradation bool) (Selection, error) {
 	s.reservationID = ""
 	s.lastConfirm = cand
 	s.hasLastConfirm = true
+	if aware {
+		kind := DecisionConfirmed
+		if acceptDegradation && !cand.Satisfied {
+			kind = DecisionDegradationAccepted
+		}
+		promised := len(cand.Picked)
+		if len(cand.CandidatePicked) > 0 {
+			promised = len(cand.CandidatePicked)
+		}
+		s.recordDecisionLocked(kind, cand.Seq,
+			promised, cand.Honored, missingCount(cand.Criteria, cand.Honored), "")
+	}
 	s.reg.mu.Lock()
 	s.reg.sessions[s.id] = s.snapshotStateLocked()
 	s.reg.mu.Unlock()
 	s.mu.Unlock()
 	return s.current, nil
+}
+
+// noteDecision records a capacity decision outside the session lock and
+// persists the session state, used on confirm rejection paths.
+func (s *Session) noteDecision(kind DecisionKind, candSeq int64, promised, honored, missing int, reason string) {
+	s.mu.Lock()
+	s.recordDecisionLocked(kind, candSeq, promised, honored, missing, reason)
+	s.reg.mu.Lock()
+	s.reg.sessions[s.id] = s.snapshotStateLocked()
+	s.reg.mu.Unlock()
+	s.mu.Unlock()
 }
 
 // evaluate computes a selection from the live directory under the registry
