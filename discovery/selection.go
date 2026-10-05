@@ -134,6 +134,75 @@ type Selection struct {
 	// Shortfall explains why the criteria cannot be met, empty when
 	// Satisfied is true.
 	Shortfall string
+	// Degradation is set when the user explicitly accepted a decision that
+	// could not be fully honored. It links the promised candidate scope to
+	// the actually confirmed scope at acceptance time.
+	Degradation *Degradation `json:"degradation,omitempty"`
+	// TopUp describes capacity added after the decision via ConfirmTopUp to
+	// close a previously accepted degradation. Nil for ordinary decisions.
+	TopUp *TopUpRecord `json:"top_up,omitempty"`
+}
+
+// Degradation records an explicitly accepted downgrade: the user confirmed
+// a candidate that could only be partially honored. The record is immutable
+// once committed, so later top-ups always trace back to the exact scope the
+// user accepted.
+type Degradation struct {
+	// Promised is the size of the full candidate set at decision time.
+	Promised int `json:"promised"`
+	// Honored is how many promised instances were actually confirmed.
+	Honored int `json:"honored"`
+	// Missing lists promised instance IDs left without confirmed capacity.
+	Missing []string `json:"missing,omitempty"`
+	// AcceptedAt is the registry-clock time the user accepted the downgrade.
+	AcceptedAt time.Time `json:"accepted_at"`
+}
+
+// TopUpRecord links a later capacity top-up to the degraded decision it
+// amends. It separates what was historically promised, what is still
+// honored now, and what remains missing; promised capacity that expired in
+// the meantime is reported on its own and never counts toward the current
+// guarantee.
+type TopUpRecord struct {
+	// Amends is the Seq of the decision this top-up closes the gap for.
+	Amends int64 `json:"amends"`
+	// Added are the instances newly confirmed by this top-up.
+	Added []Instance `json:"added,omitempty"`
+	// StillMissing are promised instances the session still does not hold
+	// usable confirmed capacity for.
+	StillMissing []Instance `json:"still_missing,omitempty"`
+	// ExpiredSincePromise lists promised instances that left the directory
+	// before the top-up; they are audited here, not merged into the
+	// current guarantee.
+	ExpiredSincePromise []StaleEntry `json:"expired_since_promise,omitempty"`
+}
+
+// TopUpPlan is the recheck-time explanation of how a session that accepted
+// a partial decision can make up the missing capacity. It ties the
+// historically promised set to the still-guaranteed and still-missing
+// parts, and lists the free units a top-up could reserve right now. The
+// plan never pre-allocates: other sessions keep contending for the same
+// free capacity until TopUpReserve actually holds it.
+type TopUpPlan struct {
+	// AmendsSeq is the Seq of the confirmed decision being topped up.
+	AmendsSeq int64
+	// Promised is the full candidate set the session once committed to.
+	Promised []Instance
+	// GuaranteedNow are promised instances whose capacity the session
+	// still holds confirmed and which remain usable right now.
+	GuaranteedNow []Instance
+	// LostGuarantee explains promised instances no longer guaranteed,
+	// with the reason (lease expired, deregistered, hold released).
+	LostGuarantee []StaleEntry
+	// Missing is how many additional usable instances are needed to meet
+	// the minimum given only the live guarantees.
+	Missing int
+	// Fillable lists usable instances with free capacity a top-up could
+	// reserve right now. Nothing is held yet; other sessions contend for
+	// the same units fairly.
+	Fillable []Instance
+	// Note ties the plan back to the accepted degradation, if any.
+	Note string
 }
 
 // StaleEntry explains why an instance from the confirmed selection is no
@@ -172,6 +241,9 @@ type Recheck struct {
 	// Switch describes the capacity transition a Confirm would perform;
 	// nil for read-only sessions that never reserved capacity.
 	Switch *SwitchPlan
+	// TopUp explains how the session could make up capacity missing from a
+	// previously accepted partial decision; nil when nothing is missing.
+	TopUp *TopUpPlan
 }
 
 // SelectionDiff compares two selection records and attributes the
@@ -253,37 +325,52 @@ type Session struct {
 	capacityAware bool
 	// reservationID identifies the session's live reservation group.
 	reservationID string
+	// topUpReservationID identifies the session's live top-up reservation
+	// group. It is independent from reservationID so a top-up lapses and
+	// is cancelled on its own basis.
+	topUpReservationID string
 	// lastConfirm makes a duplicate Confirm return the same decision
 	// instead of failing, so retries never double-allocate capacity.
 	lastConfirm    Selection
 	hasLastConfirm bool
+	// lastTopUp makes a duplicate ConfirmTopUp (e.g. a repeated
+	// notification after a directory restart) return the same decision
+	// instead of allocating again.
+	lastTopUp    Selection
+	hasLastTopUp bool
 }
 
 type persistedSession struct {
-	ID             string      `json:"id"`
-	Seq            int64       `json:"seq"`
-	Current        Selection   `json:"current"`
-	History        []Selection `json:"history"`
-	Pending        *Selection  `json:"pending,omitempty"`
-	HasPending     bool        `json:"has_pending"`
-	CapacityAware  bool        `json:"capacity_aware"`
-	ReservationID  string      `json:"reservation_id,omitempty"`
-	LastConfirm    Selection   `json:"last_confirm"`
-	HasLastConfirm bool        `json:"has_last_confirm"`
+	ID                 string      `json:"id"`
+	Seq                int64       `json:"seq"`
+	Current            Selection   `json:"current"`
+	History            []Selection `json:"history"`
+	Pending            *Selection  `json:"pending,omitempty"`
+	HasPending         bool        `json:"has_pending"`
+	CapacityAware      bool        `json:"capacity_aware"`
+	ReservationID      string      `json:"reservation_id,omitempty"`
+	TopUpReservationID string      `json:"top_up_reservation_id,omitempty"`
+	LastConfirm        Selection   `json:"last_confirm"`
+	HasLastConfirm     bool        `json:"has_last_confirm"`
+	LastTopUp          Selection   `json:"last_top_up"`
+	HasLastTopUp       bool        `json:"has_last_top_up"`
 }
 
 func (s *Session) snapshotStateLocked() persistedSession {
 	return persistedSession{
-		ID:             s.id,
-		Seq:            s.seq,
-		Current:        cloneSelection(s.current),
-		History:        cloneSelections(s.history),
-		Pending:        cloneSelectionPtr(s.pending),
-		HasPending:     s.hasPending,
-		CapacityAware:  s.capacityAware,
-		ReservationID:  s.reservationID,
-		LastConfirm:    cloneSelection(s.lastConfirm),
-		HasLastConfirm: s.hasLastConfirm,
+		ID:                 s.id,
+		Seq:                s.seq,
+		Current:            cloneSelection(s.current),
+		History:            cloneSelections(s.history),
+		Pending:            cloneSelectionPtr(s.pending),
+		HasPending:         s.hasPending,
+		CapacityAware:      s.capacityAware,
+		ReservationID:      s.reservationID,
+		TopUpReservationID: s.topUpReservationID,
+		LastConfirm:        cloneSelection(s.lastConfirm),
+		HasLastConfirm:     s.hasLastConfirm,
+		LastTopUp:          cloneSelection(s.lastTopUp),
+		HasLastTopUp:       s.hasLastTopUp,
 	}
 }
 
@@ -305,8 +392,11 @@ func (s *Session) restoreStateLocked(state persistedSession) {
 	s.hasPending = state.HasPending
 	s.capacityAware = state.CapacityAware
 	s.reservationID = state.ReservationID
+	s.topUpReservationID = state.TopUpReservationID
 	s.lastConfirm = cloneSelection(state.LastConfirm)
 	s.hasLastConfirm = state.HasLastConfirm
+	s.lastTopUp = cloneSelection(state.LastTopUp)
+	s.hasLastTopUp = state.HasLastTopUp
 }
 
 func cloneSelectionPtr(in *Selection) *Selection {
@@ -339,6 +429,18 @@ func cloneSelection(in Selection) Selection {
 	}
 	out.Picked = cloneInstances(in.Picked)
 	out.CandidatePicked = cloneInstances(in.CandidatePicked)
+	if in.Degradation != nil {
+		d := *in.Degradation
+		d.Missing = append([]string(nil), in.Degradation.Missing...)
+		out.Degradation = &d
+	}
+	if in.TopUp != nil {
+		tr := *in.TopUp
+		tr.Added = cloneInstances(in.TopUp.Added)
+		tr.StillMissing = cloneInstances(in.TopUp.StillMissing)
+		tr.ExpiredSincePromise = append([]StaleEntry(nil), in.TopUp.ExpiredSincePromise...)
+		out.TopUp = &tr
+	}
 	return out
 }
 
@@ -512,6 +614,67 @@ func (s *Session) fillCapacityViewLocked(rc *Recheck, base Selection, c Criteria
 		}
 		rc.Switch = plan
 	}
+	s.fillTopUpPlanLocked(rc, base, c, usable, confirmed)
+}
+
+// fillTopUpPlanLocked annotates a recheck with the session's top-up
+// position: what the confirmed decision once promised, what is still
+// guaranteed right now, and which free units could close the remaining
+// gap. Promised capacity that has since expired is reported as lost, never
+// counted toward the current guarantee.
+func (s *Session) fillTopUpPlanLocked(rc *Recheck, base Selection, c Criteria, usable map[string]bool, confirmed map[string]bool) {
+	promised := base.CandidatePicked
+	if len(promised) == 0 {
+		promised = base.Picked
+	}
+	if len(promised) == 0 {
+		return
+	}
+	verdictByID := map[string]Verdict{}
+	for _, v := range rc.Candidate.Verdicts {
+		verdictByID[v.Instance.ID] = v
+	}
+	plan := &TopUpPlan{AmendsSeq: base.Seq, Promised: cloneInstances(promised)}
+	for _, inst := range promised {
+		if confirmed[inst.ID] && usable[inst.ID] {
+			plan.GuaranteedNow = append(plan.GuaranteedNow, inst)
+			continue
+		}
+		reason := ""
+		switch {
+		case confirmed[inst.ID]:
+			reason = s.reg.staleReasonLocked(inst, c, verdictByID[inst.ID])
+		default:
+			if rec, gone := s.reg.removals[key(inst.Service, inst.ID)]; gone {
+				reason = departureReason(rec)
+			} else {
+				reason = "no capacity hold (never confirmed, expired, cancelled or released)"
+			}
+		}
+		plan.LostGuarantee = append(plan.LostGuarantee, StaleEntry{Instance: inst, Reason: reason})
+	}
+	plan.Missing = c.MinAvailable - len(plan.GuaranteedNow)
+	if plan.Missing <= 0 {
+		return
+	}
+	for _, inst := range rc.Candidate.Picked {
+		if confirmed[inst.ID] {
+			continue
+		}
+		if s.reg.freeCapacityLocked(inst, s.id) > 0 {
+			plan.Fillable = append(plan.Fillable, inst)
+		}
+	}
+	if base.Degradation != nil {
+		plan.Note = fmt.Sprintf(
+			"decision #%d was accepted degraded with %d of %d promised instance(s); a top-up reserves at most %d currently free unit(s) with its own expiry and never displaces other sessions",
+			base.Seq, base.Degradation.Honored, base.Degradation.Promised, plan.Missing)
+	} else {
+		plan.Note = fmt.Sprintf(
+			"decision #%d promised %d instance(s) of which %d remain guaranteed; a top-up reserves at most %d currently free unit(s) with its own expiry",
+			base.Seq, len(promised), len(plan.GuaranteedNow), plan.Missing)
+	}
+	rc.TopUp = plan
 }
 
 func departureReason(rec RemovalRecord) string {
@@ -657,7 +820,7 @@ func (s *Session) confirm(acceptDegradation bool) (Selection, error) {
 
 		for id, h := range s.reg.holds {
 			if h.SessionID == s.id && h.Kind == HoldReserved &&
-				(resID == "" || strings.HasPrefix(id, resID+":")) {
+				resID != "" && strings.HasPrefix(id, resID+":") {
 				delete(s.reg.holds, id)
 			}
 			if h.SessionID == s.id && h.Kind == HoldConfirmed &&
@@ -676,6 +839,23 @@ func (s *Session) confirm(acceptDegradation bool) (Selection, error) {
 			committed.Shortfall = fmt.Sprintf(
 				"only %d of %d required instance(s) are confirmed and usable",
 				committed.Honored, committed.Criteria.MinAvailable)
+			if acceptDegradation {
+				pickedIDs := map[string]bool{}
+				for _, inst := range plan {
+					pickedIDs[inst.ID] = true
+				}
+				deg := &Degradation{
+					Promised:   len(committed.CandidatePicked),
+					Honored:    committed.Honored,
+					AcceptedAt: now,
+				}
+				for _, inst := range committed.CandidatePicked {
+					if !pickedIDs[inst.ID] {
+						deg.Missing = append(deg.Missing, inst.ID)
+					}
+				}
+				committed.Degradation = deg
+			}
 		}
 		cand = committed
 	}

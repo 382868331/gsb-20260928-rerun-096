@@ -25,6 +25,9 @@ var (
 	// holds enough confirmed capacity; the user must explicitly accept the
 	// downgrade via ConfirmAcceptingDegradation or keep the old selection.
 	ErrDegradationNeedsAccept = errors.New("discovery: switch degrades below minimum; explicit acceptance required")
+	// ErrNoPendingTopUp is returned by ConfirmTopUp when no top-up
+	// reservation is pending and no top-up decision exists to repeat.
+	ErrNoPendingTopUp = errors.New("discovery: no pending top-up to confirm")
 )
 
 // HoldKind distinguishes a temporary reservation from confirmed usage.
@@ -200,6 +203,7 @@ func (s *Session) Reserve(ttl time.Duration) (Reservation, error) {
 		s.hasPending = true
 	}
 	cand := *s.pending
+	prevResID := s.reservationID
 	s.mu.Unlock()
 
 	now := s.reg.clock.Now()
@@ -212,10 +216,14 @@ func (s *Session) Reserve(ttl time.Duration) (Reservation, error) {
 	}
 	s.reg.mu.Lock()
 	s.reg.expireStaleLocked(now)
-	// Re-reserving replaces the session's previous reserved holds.
-	for id, h := range s.reg.holds {
-		if h.SessionID == s.id && h.Kind == HoldReserved {
-			delete(s.reg.holds, id)
+	// Re-reserving replaces the session's previous switch reservation
+	// group; an independent top-up group is left untouched.
+	if prevResID != "" {
+		for id, h := range s.reg.holds {
+			if h.SessionID == s.id && h.Kind == HoldReserved &&
+				strings.HasPrefix(id, prevResID+":") {
+				delete(s.reg.holds, id)
+			}
 		}
 	}
 	for _, inst := range cand.Picked {
@@ -260,15 +268,19 @@ func (s *Session) Reserve(ttl time.Duration) (Reservation, error) {
 }
 
 // CancelReservation releases the session's reserved (not yet confirmed)
-// holds. It is idempotent: repeating it is a no-op and never releases
-// capacity twice or touches confirmed usage.
+// switch holds. It is idempotent: repeating it is a no-op and never
+// releases capacity twice or touches confirmed usage. An independent
+// top-up reservation group is not affected; use CancelTopUp for it.
 func (s *Session) CancelReservation() {
 	s.mu.Lock()
 	s.reg.mu.Lock()
 	s.reg.expireStaleLocked(s.reg.clock.Now())
-	for id, h := range s.reg.holds {
-		if h.SessionID == s.id && h.Kind == HoldReserved {
-			delete(s.reg.holds, id)
+	if s.reservationID != "" {
+		for id, h := range s.reg.holds {
+			if h.SessionID == s.id && h.Kind == HoldReserved &&
+				strings.HasPrefix(id, s.reservationID+":") {
+				delete(s.reg.holds, id)
+			}
 		}
 	}
 	s.reservationID = ""
@@ -336,4 +348,282 @@ func (r *Registry) ResumeSelectionSession(sessionID string, c Criteria) (*Sessio
 	r.mu.Unlock()
 	s.persistState()
 	return s, nil
+}
+
+// TopUpReserve reserves additional capacity to close the gap left by a
+// partially honored (explicitly degraded) decision, without touching the
+// session's confirmed holds. Only currently free units are held, and never
+// more than the missing count, so the candidate list is not pre-filled and
+// other sessions keep contending fairly for the remaining free capacity.
+// The new holds form their own reservation group with their own expiry,
+// independent of any switch reservation.
+func (s *Session) TopUpReserve(ttl time.Duration) (Reservation, error) {
+	if ttl <= 0 {
+		return Reservation{}, fmt.Errorf("%w: reservation ttl must be positive", ErrBadArgument)
+	}
+	s.mu.Lock()
+	if !s.capacityAware {
+		s.mu.Unlock()
+		return Reservation{}, fmt.Errorf("%w: session holds no capacity decision to top up", ErrBadArgument)
+	}
+	cur := s.current
+	prevTopUpID := s.topUpReservationID
+	s.mu.Unlock()
+
+	promised := cur.CandidatePicked
+	if len(promised) == 0 {
+		promised = cur.Picked
+	}
+	now := s.reg.clock.Now()
+	res := Reservation{
+		ID:        newToken(),
+		SessionID: s.id,
+		Criteria:  cur.Criteria,
+		ExpiresAt: now.Add(ttl),
+	}
+	s.reg.mu.Lock()
+	s.reg.expireStaleLocked(now)
+	cand := s.reg.evaluateLocked(cur.Criteria, 0)
+	usable := map[string]Instance{}
+	for _, inst := range cand.Picked {
+		usable[inst.ID] = inst
+	}
+	guaranteed := 0
+	for _, inst := range promised {
+		if _, ok := usable[inst.ID]; ok &&
+			s.reg.hasConfirmedHoldLocked(s.id, inst.Service, inst.ID) {
+			guaranteed++
+		}
+	}
+	missing := cur.Criteria.MinAvailable - guaranteed
+	if missing <= 0 {
+		s.reg.mu.Unlock()
+		res.Satisfied = true
+		return res, nil
+	}
+	// Replace any previous top-up group; only the top-up group is touched.
+	if prevTopUpID != "" {
+		for id, h := range s.reg.holds {
+			if h.SessionID == s.id && h.Kind == HoldReserved &&
+				strings.HasPrefix(id, prevTopUpID+":") {
+				delete(s.reg.holds, id)
+			}
+		}
+	}
+	for _, inst := range cand.Picked {
+		if len(res.Picks) >= missing {
+			break
+		}
+		if s.reg.hasConfirmedHoldLocked(s.id, inst.Service, inst.ID) {
+			continue
+		}
+		if s.reg.freeCapacityLocked(inst, s.id) <= 0 {
+			continue
+		}
+		s.reg.holds[res.ID+":"+inst.ID] = Hold{
+			ID:         res.ID + ":" + inst.ID,
+			SessionID:  s.id,
+			Service:    inst.Service,
+			InstanceID: inst.ID,
+			Kind:       HoldReserved,
+			CreatedAt:  now,
+			ExpiresAt:  res.ExpiresAt,
+		}
+		res.Picks = append(res.Picks, inst)
+	}
+	s.reg.mu.Unlock()
+
+	res.Satisfied = len(res.Picks) >= missing
+	if !res.Satisfied {
+		res.Shortfall = fmt.Sprintf(
+			"need %d more usable instance(s) for %q but only %d had free capacity",
+			missing, cur.Criteria.Service, len(res.Picks))
+	}
+
+	s.mu.Lock()
+	s.topUpReservationID = res.ID
+	s.reg.mu.Lock()
+	s.reg.sessions[s.id] = s.snapshotStateLocked()
+	s.reg.mu.Unlock()
+	s.mu.Unlock()
+	return res, nil
+}
+
+// CancelTopUp releases the session's top-up reservation group only. It is
+// idempotent and never touches confirmed usage or a switch reservation.
+func (s *Session) CancelTopUp() {
+	s.mu.Lock()
+	s.reg.mu.Lock()
+	s.reg.expireStaleLocked(s.reg.clock.Now())
+	if s.topUpReservationID != "" {
+		for id, h := range s.reg.holds {
+			if h.SessionID == s.id && h.Kind == HoldReserved &&
+				strings.HasPrefix(id, s.topUpReservationID+":") {
+				delete(s.reg.holds, id)
+			}
+		}
+	}
+	s.topUpReservationID = ""
+	s.reg.sessions[s.id] = s.snapshotStateLocked()
+	s.reg.mu.Unlock()
+	s.mu.Unlock()
+}
+
+// ConfirmTopUp turns the pending top-up reservation into confirmed usage,
+// keeping every previously confirmed hold. If the top-up reservation
+// lapsed, only still-free units are re-acquired, capped at the remaining
+// deficit; capacity owned by other sessions is never taken. The committed
+// record keeps the historically promised set (CandidatePicked), reports
+// what is honored now (Picked/Honored) and what is still missing, and
+// lists promised capacity that expired in the meantime separately instead
+// of merging it into the current guarantee. Repeating ConfirmTopUp after a
+// successful one (e.g. a duplicate notification after a directory restart)
+// returns the same decision without allocating anything again.
+func (s *Session) ConfirmTopUp() (Selection, error) {
+	s.mu.Lock()
+	resID := s.topUpReservationID
+	if resID == "" {
+		if s.hasLastTopUp {
+			sel := s.lastTopUp
+			s.mu.Unlock()
+			return sel, nil
+		}
+		s.mu.Unlock()
+		return Selection{}, ErrNoPendingTopUp
+	}
+	cur := s.current
+	s.mu.Unlock()
+
+	promised := cur.CandidatePicked
+	if len(promised) == 0 {
+		promised = cur.Picked
+	}
+	now := s.reg.clock.Now()
+	s.reg.mu.Lock()
+	s.reg.expireStaleLocked(now)
+	cand := s.reg.evaluateLocked(cur.Criteria, 0)
+	usable := map[string]Instance{}
+	for _, inst := range cand.Picked {
+		usable[inst.ID] = inst
+	}
+
+	// Convert live top-up reserved holds to confirmed usage. Holds whose
+	// instance left or became unusable are dropped, never confirmed.
+	added := map[string]bool{}
+	prefix := resID + ":"
+	for id, h := range s.reg.holds {
+		if h.SessionID != s.id || h.Kind != HoldReserved ||
+			!strings.HasPrefix(id, prefix) {
+			continue
+		}
+		if _, ok := usable[h.InstanceID]; ok {
+			h.Kind = HoldConfirmed
+			h.ExpiresAt = time.Time{}
+			s.reg.holds[id] = h
+			added[h.InstanceID] = true
+		} else {
+			delete(s.reg.holds, id)
+		}
+	}
+	// A lapsed top-up reservation is re-acquired only from still-free
+	// capacity, capped at the remaining deficit.
+	if len(added) == 0 {
+		guaranteed := 0
+		for _, inst := range promised {
+			if _, ok := usable[inst.ID]; ok &&
+				s.reg.hasConfirmedHoldLocked(s.id, inst.Service, inst.ID) {
+				guaranteed++
+			}
+		}
+		missing := cur.Criteria.MinAvailable - guaranteed
+		for _, inst := range cand.Picked {
+			if missing <= 0 {
+				break
+			}
+			if s.reg.hasConfirmedHoldLocked(s.id, inst.Service, inst.ID) ||
+				s.reg.freeCapacityLocked(inst, s.id) <= 0 {
+				continue
+			}
+			hid := newToken()
+			s.reg.holds[hid] = Hold{
+				ID:         hid,
+				SessionID:  s.id,
+				Service:    inst.Service,
+				InstanceID: inst.ID,
+				Kind:       HoldConfirmed,
+				CreatedAt:  now,
+			}
+			added[inst.ID] = true
+			missing--
+		}
+	}
+
+	// The deliverable set is every usable instance the session now holds
+	// confirmed, in candidate ranking order. Expired promised capacity is
+	// excluded here and reported separately on the top-up record.
+	var picked []Instance
+	for _, inst := range cand.Picked {
+		if s.reg.hasConfirmedHoldLocked(s.id, inst.Service, inst.ID) {
+			picked = append(picked, inst)
+		}
+	}
+	pickedSet := map[string]bool{}
+	for _, inst := range picked {
+		pickedSet[inst.ID] = true
+	}
+	topUp := &TopUpRecord{Amends: cur.Seq}
+	for id := range added {
+		if inst, ok := usable[id]; ok {
+			topUp.Added = append(topUp.Added, inst)
+		}
+	}
+	sort.Slice(topUp.Added, func(i, j int) bool { return topUp.Added[i].ID < topUp.Added[j].ID })
+	for _, inst := range promised {
+		if pickedSet[inst.ID] {
+			continue
+		}
+		topUp.StillMissing = append(topUp.StillMissing, inst)
+		if rec, gone := s.reg.removals[key(inst.Service, inst.ID)]; gone {
+			topUp.ExpiredSincePromise = append(topUp.ExpiredSincePromise,
+				StaleEntry{Instance: inst, Reason: departureReason(rec)})
+		}
+	}
+	s.reg.mu.Unlock()
+
+	committed := cand
+	committed.Criteria = Criteria{
+		Service:         cur.Criteria.Service,
+		Capabilities:    append([]string(nil), cur.Criteria.Capabilities...),
+		PreferredRegion: cur.Criteria.PreferredRegion,
+		MinAvailable:    cur.Criteria.MinAvailable,
+	}
+	committed.CandidatePicked = cloneInstances(promised)
+	committed.Picked = picked
+	committed.Honored = len(picked)
+	committed.Satisfied = committed.Honored >= cur.Criteria.MinAvailable
+	if !committed.Satisfied {
+		committed.Shortfall = fmt.Sprintf(
+			"only %d of %d required instance(s) are confirmed and usable",
+			committed.Honored, cur.Criteria.MinAvailable)
+	}
+	if cur.Degradation != nil {
+		deg := *cur.Degradation
+		deg.Missing = append([]string(nil), cur.Degradation.Missing...)
+		committed.Degradation = &deg
+	}
+	committed.TopUp = topUp
+
+	s.mu.Lock()
+	s.seq++
+	committed.Seq = s.seq
+	s.current = committed
+	s.history = append(s.history, committed)
+	s.topUpReservationID = ""
+	s.lastTopUp = committed
+	s.hasLastTopUp = true
+	s.reg.mu.Lock()
+	s.reg.sessions[s.id] = s.snapshotStateLocked()
+	s.reg.mu.Unlock()
+	s.mu.Unlock()
+	return committed, nil
 }
